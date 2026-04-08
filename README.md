@@ -114,7 +114,7 @@ flowchart TD
 
 ```bash
 docker build -t sql-processor .
-docker run -it --rm sql-processor bash -lc "make && ./sql_processor"
+docker run -it sql-processor bash -lc "make && ./sql_processor"
 ```
 
 ## 데모 시나리오
