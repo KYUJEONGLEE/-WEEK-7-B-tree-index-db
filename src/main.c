@@ -208,14 +208,19 @@ static int main_run_repl_mode(void) {
 }
 
 int main(int argc, char *argv[]) {
+    int status;
+
     if (argc > 2) {
         fprintf(stderr, "Usage: %s [sql_file]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     if (argc == 2) {
-        return main_run_file_mode(argv[1]) == SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+        status = main_run_file_mode(argv[1]);
+    } else {
+        status = main_run_repl_mode();
     }
 
-    return main_run_repl_mode() == SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+    soft_parser_cleanup_cache();
+    return status == SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

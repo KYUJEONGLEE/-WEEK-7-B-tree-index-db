@@ -37,7 +37,8 @@ typedef struct {
 } TableIndex;
 
 /*
- * Build in-memory equality and range indexes for one table column.
+ * Build transient in-memory equality and range indexes for one table column.
+ * The index is rebuilt during query execution and is not persisted on disk.
  */
 int index_build(const TableData *table, int column_index, TableIndex *out_index);
 

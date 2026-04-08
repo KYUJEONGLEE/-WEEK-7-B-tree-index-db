@@ -90,31 +90,35 @@ static void executor_print_table(char headers[][MAX_IDENTIFIER_LEN], int header_
     int widths[MAX_COLUMNS];
     int i;
     int j;
-    size_t cell_length;
+    int cell_width;
 
     for (i = 0; i < header_count; i++) {
-        widths[i] = (int)strlen(headers[i]);
+        widths[i] = utils_display_width(headers[i]);
     }
 
     for (i = 0; i < row_count; i++) {
         for (j = 0; j < header_count; j++) {
-            cell_length = strlen(rows[i][j]);
-            if ((int)cell_length > widths[j]) {
-                widths[j] = (int)cell_length;
+            cell_width = utils_display_width(rows[i][j]);
+            if (cell_width > widths[j]) {
+                widths[j] = cell_width;
             }
         }
     }
 
     executor_print_border(widths, header_count);
     for (i = 0; i < header_count; i++) {
-        printf("| %-*s ", widths[i], headers[i]);
+        printf("| ");
+        utils_print_padded(stdout, headers[i], widths[i]);
+        putchar(' ');
     }
     puts("|");
     executor_print_border(widths, header_count);
 
     for (i = 0; i < row_count; i++) {
         for (j = 0; j < header_count; j++) {
-            printf("| %-*s ", widths[j], rows[i][j]);
+            printf("| ");
+            utils_print_padded(stdout, rows[i][j], widths[j]);
+            putchar(' ');
         }
         puts("|");
     }

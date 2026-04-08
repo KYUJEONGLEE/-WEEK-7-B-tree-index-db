@@ -29,6 +29,21 @@ typedef struct {
 Token *soft_parse(const char *sql, int *token_count);
 
 /*
+ * Release all cached tokenized SQL statements held by the soft parser.
+ */
+void soft_parser_cleanup_cache(void);
+
+/*
+ * Return the number of cached SQL statements currently stored.
+ */
+int soft_parser_get_cache_entry_count(void);
+
+/*
+ * Return the number of cache hits since the last cleanup.
+ */
+int soft_parser_get_cache_hit_count(void);
+
+/*
  * Return a human-readable name for a token type.
  */
 const char *soft_parser_token_type_name(TokenType type);

@@ -318,3 +318,145 @@ char *utils_substring(const char *text, size_t start, size_t length) {
     copy[length] = '\0';
     return copy;
 }
+
+static int utils_utf8_decode(const unsigned char *text, size_t *consumed,
+                             unsigned int *codepoint) {
+    unsigned char first;
+
+    if (text == NULL || consumed == NULL || codepoint == NULL) {
+        return FAILURE;
+    }
+
+    first = text[0];
+    if (first == '\0') {
+        *consumed = 0;
+        *codepoint = 0;
+        return SUCCESS;
+    }
+
+    if (first < 0x80U) {
+        *consumed = 1;
+        *codepoint = first;
+        return SUCCESS;
+    }
+
+    if (first >= 0xC2U && first <= 0xDFU &&
+        (text[1] & 0xC0U) == 0x80U) {
+        *consumed = 2;
+        *codepoint = ((unsigned int)(first & 0x1FU) << 6) |
+                     (unsigned int)(text[1] & 0x3FU);
+        return SUCCESS;
+    }
+
+    if (first >= 0xE0U && first <= 0xEFU &&
+        (text[1] & 0xC0U) == 0x80U &&
+        (text[2] & 0xC0U) == 0x80U) {
+        if ((first == 0xE0U && text[1] < 0xA0U) ||
+            (first == 0xEDU && text[1] >= 0xA0U)) {
+            return FAILURE;
+        }
+
+        *consumed = 3;
+        *codepoint = ((unsigned int)(first & 0x0FU) << 12) |
+                     ((unsigned int)(text[1] & 0x3FU) << 6) |
+                     (unsigned int)(text[2] & 0x3FU);
+        return SUCCESS;
+    }
+
+    if (first >= 0xF0U && first <= 0xF4U &&
+        (text[1] & 0xC0U) == 0x80U &&
+        (text[2] & 0xC0U) == 0x80U &&
+        (text[3] & 0xC0U) == 0x80U) {
+        if ((first == 0xF0U && text[1] < 0x90U) ||
+            (first == 0xF4U && text[1] >= 0x90U)) {
+            return FAILURE;
+        }
+
+        *consumed = 4;
+        *codepoint = ((unsigned int)(first & 0x07U) << 18) |
+                     ((unsigned int)(text[1] & 0x3FU) << 12) |
+                     ((unsigned int)(text[2] & 0x3FU) << 6) |
+                     (unsigned int)(text[3] & 0x3FU);
+        return SUCCESS;
+    }
+
+    return FAILURE;
+}
+
+static int utils_is_zero_width_codepoint(unsigned int codepoint) {
+    return
+        (codepoint >= 0x0300U && codepoint <= 0x036FU) ||
+        (codepoint >= 0x1AB0U && codepoint <= 0x1AFFU) ||
+        (codepoint >= 0x1DC0U && codepoint <= 0x1DFFU) ||
+        (codepoint >= 0x20D0U && codepoint <= 0x20FFU) ||
+        (codepoint >= 0xFE20U && codepoint <= 0xFE2FU);
+}
+
+static int utils_is_wide_codepoint(unsigned int codepoint) {
+    return
+        codepoint == 0x2329U || codepoint == 0x232AU ||
+        (codepoint >= 0x1100U &&
+         (codepoint <= 0x115FU ||
+          codepoint == 0x303FU ||
+          (codepoint >= 0x2E80U && codepoint <= 0xA4CFU) ||
+          (codepoint >= 0xAC00U && codepoint <= 0xD7A3U) ||
+          (codepoint >= 0xF900U && codepoint <= 0xFAFFU) ||
+          (codepoint >= 0xFE10U && codepoint <= 0xFE19U) ||
+          (codepoint >= 0xFE30U && codepoint <= 0xFE6FU) ||
+          (codepoint >= 0xFF00U && codepoint <= 0xFF60U) ||
+          (codepoint >= 0xFFE0U && codepoint <= 0xFFE6U) ||
+          (codepoint >= 0x1F300U && codepoint <= 0x1FAFFU) ||
+          (codepoint >= 0x20000U && codepoint <= 0x3FFFD)));
+}
+
+int utils_display_width(const char *text) {
+    const unsigned char *cursor;
+    size_t consumed;
+    unsigned int codepoint;
+    int width;
+
+    if (text == NULL) {
+        return 0;
+    }
+
+    cursor = (const unsigned char *)text;
+    width = 0;
+    while (*cursor != '\0') {
+        if (utils_utf8_decode(cursor, &consumed, &codepoint) != SUCCESS ||
+            consumed == 0) {
+            consumed = 1;
+            codepoint = *cursor;
+        }
+
+        if (codepoint == '\t') {
+            width += 4;
+        } else if (codepoint < 0x20U || (codepoint >= 0x7FU && codepoint < 0xA0U)) {
+            /* Control characters do not take a printable cell. */
+        } else if (utils_is_zero_width_codepoint(codepoint)) {
+            /* Combining characters share the previous cell. */
+        } else if (utils_is_wide_codepoint(codepoint)) {
+            width += 2;
+        } else {
+            width += 1;
+        }
+
+        cursor += consumed;
+    }
+
+    return width;
+}
+
+void utils_print_padded(FILE *stream, const char *text, int target_width) {
+    int current_width;
+    int i;
+
+    if (stream == NULL || text == NULL) {
+        return;
+    }
+
+    fputs(text, stream);
+    current_width = utils_display_width(text);
+    for (i = current_width; i < target_width; i++) {
+        fputc(' ', stream);
+    }
+}

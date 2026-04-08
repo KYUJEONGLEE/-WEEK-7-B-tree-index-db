@@ -16,6 +16,8 @@ int main(void) {
     Token *tokens;
     int token_count;
 
+    soft_parser_cleanup_cache();
+
     tokens = soft_parse(
         "insert INTO users (id, name, age) VALUES (1, 'Lee, Jr.', 30);",
         &token_count);
@@ -61,6 +63,34 @@ int main(void) {
         return EXIT_FAILURE;
     }
     free(tokens);
+
+    if (assert_true(soft_parser_get_cache_entry_count() == 3,
+                    "three unique statements should be cached") != SUCCESS ||
+        assert_true(soft_parser_get_cache_hit_count() == 0,
+                    "cache hit count should still be zero before reuse") != SUCCESS) {
+        soft_parser_cleanup_cache();
+        return EXIT_FAILURE;
+    }
+
+    tokens = soft_parse("Select * FROM users WHERE age >= 27;", &token_count);
+    if (assert_true(tokens != NULL, "cached parse should still return tokens") != SUCCESS ||
+        assert_true(soft_parser_get_cache_entry_count() == 3,
+                    "cache size should stay stable on repeated SQL") != SUCCESS ||
+        assert_true(soft_parser_get_cache_hit_count() == 1,
+                    "repeated SQL should produce a cache hit") != SUCCESS) {
+        free(tokens);
+        soft_parser_cleanup_cache();
+        return EXIT_FAILURE;
+    }
+    free(tokens);
+
+    soft_parser_cleanup_cache();
+    if (assert_true(soft_parser_get_cache_entry_count() == 0,
+                    "cache cleanup should release stored statements") != SUCCESS ||
+        assert_true(soft_parser_get_cache_hit_count() == 0,
+                    "cache cleanup should reset hit count") != SUCCESS) {
+        return EXIT_FAILURE;
+    }
 
     puts("[PASS] soft parser");
     return EXIT_SUCCESS;

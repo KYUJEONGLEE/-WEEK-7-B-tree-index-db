@@ -2,6 +2,7 @@
 #define UTILS_H
 
 #include <stddef.h>
+#include <stdio.h>
 
 #define SUCCESS 0
 #define FAILURE -1
@@ -99,5 +100,16 @@ int utils_has_statement_terminator(const char *text);
  * Caller owns the returned memory.
  */
 char *utils_substring(const char *text, size_t start, size_t length);
+
+/*
+ * Return the terminal display width of UTF-8 text.
+ * ASCII characters count as 1, common CJK wide characters count as 2.
+ */
+int utils_display_width(const char *text);
+
+/*
+ * Print text and pad trailing spaces until the requested display width is met.
+ */
+void utils_print_padded(FILE *stream, const char *text, int target_width);
 
 #endif

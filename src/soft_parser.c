@@ -5,6 +5,146 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct SoftParserCacheEntry {
+    char *sql;
+    Token *tokens;
+    int token_count;
+    struct SoftParserCacheEntry *next;
+} SoftParserCacheEntry;
+
+#define SOFT_PARSER_CACHE_LIMIT 64
+
+static SoftParserCacheEntry *soft_parser_cache_head = NULL;
+static int soft_parser_cache_entry_count = 0;
+static int soft_parser_cache_hit_count = 0;
+
+static void soft_parser_free_cache_entry(SoftParserCacheEntry *entry) {
+    if (entry == NULL) {
+        return;
+    }
+
+    free(entry->sql);
+    free(entry->tokens);
+    free(entry);
+}
+
+static Token *soft_parser_clone_tokens(const Token *tokens, int token_count) {
+    Token *copy;
+
+    if (tokens == NULL || token_count <= 0) {
+        return NULL;
+    }
+
+    copy = (Token *)malloc((size_t)token_count * sizeof(Token));
+    if (copy == NULL) {
+        fprintf(stderr, "Error: Failed to allocate memory for soft parser cache.\n");
+        return NULL;
+    }
+
+    memcpy(copy, tokens, (size_t)token_count * sizeof(Token));
+    return copy;
+}
+
+static void soft_parser_evict_oldest_cache_entry(void) {
+    SoftParserCacheEntry *previous;
+    SoftParserCacheEntry *entry;
+
+    if (soft_parser_cache_head == NULL) {
+        return;
+    }
+
+    previous = NULL;
+    entry = soft_parser_cache_head;
+    while (entry->next != NULL) {
+        previous = entry;
+        entry = entry->next;
+    }
+
+    if (previous == NULL) {
+        soft_parser_cache_head = NULL;
+    } else {
+        previous->next = NULL;
+    }
+
+    soft_parser_free_cache_entry(entry);
+    soft_parser_cache_entry_count--;
+}
+
+static Token *soft_parser_lookup_cache(const char *sql, int *token_count) {
+    SoftParserCacheEntry *entry;
+    SoftParserCacheEntry *previous;
+    Token *copy;
+
+    if (sql == NULL || token_count == NULL) {
+        return NULL;
+    }
+
+    previous = NULL;
+    entry = soft_parser_cache_head;
+    while (entry != NULL) {
+        if (strcmp(entry->sql, sql) == 0) {
+            if (previous != NULL) {
+                previous->next = entry->next;
+                entry->next = soft_parser_cache_head;
+                soft_parser_cache_head = entry;
+            }
+
+            copy = soft_parser_clone_tokens(entry->tokens, entry->token_count);
+            if (copy == NULL) {
+                return NULL;
+            }
+
+            *token_count = entry->token_count;
+            soft_parser_cache_hit_count++;
+            return copy;
+        }
+
+        previous = entry;
+        entry = entry->next;
+    }
+
+    return NULL;
+}
+
+static int soft_parser_store_cache(const char *sql, const Token *tokens,
+                                   int token_count) {
+    SoftParserCacheEntry *entry;
+
+    if (sql == NULL || tokens == NULL || token_count <= 0) {
+        return FAILURE;
+    }
+
+    entry = (SoftParserCacheEntry *)calloc(1, sizeof(SoftParserCacheEntry));
+    if (entry == NULL) {
+        fprintf(stderr, "Error: Failed to allocate memory for soft parser cache.\n");
+        return FAILURE;
+    }
+
+    entry->sql = utils_strdup(sql);
+    if (entry->sql == NULL) {
+        free(entry);
+        return FAILURE;
+    }
+
+    entry->tokens = soft_parser_clone_tokens(tokens, token_count);
+    if (entry->tokens == NULL) {
+        free(entry->sql);
+        free(entry);
+        return FAILURE;
+    }
+
+    entry->token_count = token_count;
+    entry->next = soft_parser_cache_head;
+    soft_parser_cache_head = entry;
+    soft_parser_cache_entry_count++;
+
+    if (soft_parser_cache_entry_count > SOFT_PARSER_CACHE_LIMIT) {
+        soft_parser_evict_oldest_cache_entry();
+    }
+
+    return SUCCESS;
+}
+
 static int soft_parser_append_token(Token **tokens, int *count, int *capacity,
                                     TokenType type, const char *value) {
     Token *new_tokens;
@@ -128,14 +268,178 @@ static int soft_parser_is_numeric_start(const char *sql, size_t index) {
     return 0;
 }
 
-Token *soft_parse(const char *sql, int *token_count) {
+static Token *soft_parser_tokenize_sql(const char *sql, int *token_count) {
     Token *tokens;
     int count;
     int capacity;
-    char *working_sql;
     char upper_buffer[MAX_TOKEN_VALUE];
     char token_buffer[MAX_TOKEN_VALUE];
     size_t i;
+
+    if (sql == NULL || token_count == NULL) {
+        return NULL;
+    }
+
+    *token_count = 0;
+    tokens = NULL;
+    count = 0;
+    capacity = 0;
+    i = 0;
+    while (sql[i] != '\0') {
+        if (isspace((unsigned char)sql[i])) {
+            i++;
+            continue;
+        }
+
+        if (sql[i] == '(') {
+            if (soft_parser_append_token(&tokens, &count, &capacity, TOKEN_LPAREN,
+                                         "(") != SUCCESS) {
+                free(tokens);
+                return NULL;
+            }
+            i++;
+            continue;
+        }
+
+        if (sql[i] == ')') {
+            if (soft_parser_append_token(&tokens, &count, &capacity, TOKEN_RPAREN,
+                                         ")") != SUCCESS) {
+                free(tokens);
+                return NULL;
+            }
+            i++;
+            continue;
+        }
+
+        if (sql[i] == ',') {
+            if (soft_parser_append_token(&tokens, &count, &capacity, TOKEN_COMMA,
+                                         ",") != SUCCESS) {
+                free(tokens);
+                return NULL;
+            }
+            i++;
+            continue;
+        }
+
+        if (sql[i] == ';') {
+            if (soft_parser_append_token(&tokens, &count, &capacity,
+                                         TOKEN_SEMICOLON, ";") != SUCCESS) {
+                free(tokens);
+                return NULL;
+            }
+            i++;
+            continue;
+        }
+
+        if (sql[i] == '*') {
+            if (soft_parser_append_token(&tokens, &count, &capacity,
+                                         TOKEN_IDENTIFIER, "*") != SUCCESS) {
+                free(tokens);
+                return NULL;
+            }
+            i++;
+            continue;
+        }
+
+        if (sql[i] == '\'') {
+            if (soft_parser_read_string(sql, &i, token_buffer,
+                                        sizeof(token_buffer)) != SUCCESS) {
+                fprintf(stderr, "Error: Unterminated string literal.\n");
+                free(tokens);
+                return NULL;
+            }
+
+            if (soft_parser_append_token(&tokens, &count, &capacity,
+                                         TOKEN_STR_LITERAL, token_buffer) != SUCCESS) {
+                free(tokens);
+                return NULL;
+            }
+            continue;
+        }
+
+        if (sql[i] == '!' || sql[i] == '<' || sql[i] == '>' || sql[i] == '=') {
+            token_buffer[0] = sql[i];
+            token_buffer[1] = '\0';
+            if ((sql[i] == '!' || sql[i] == '<' || sql[i] == '>') &&
+                sql[i + 1] == '=') {
+                token_buffer[1] = '=';
+                token_buffer[2] = '\0';
+                i += 2;
+            } else {
+                i++;
+            }
+
+            if (soft_parser_append_token(&tokens, &count, &capacity,
+                                         TOKEN_OPERATOR, token_buffer) != SUCCESS) {
+                free(tokens);
+                return NULL;
+            }
+            continue;
+        }
+
+        if (soft_parser_is_numeric_start(sql, i)) {
+            if (soft_parser_read_number(sql, &i, token_buffer,
+                                        sizeof(token_buffer)) != SUCCESS) {
+                fprintf(stderr, "Error: Integer literal is too long.\n");
+                free(tokens);
+                return NULL;
+            }
+
+            if (soft_parser_append_token(&tokens, &count, &capacity,
+                                         TOKEN_INT_LITERAL, token_buffer) != SUCCESS) {
+                free(tokens);
+                return NULL;
+            }
+            continue;
+        }
+
+        if (isalpha((unsigned char)sql[i]) || sql[i] == '_') {
+            if (soft_parser_read_word(sql, &i, token_buffer,
+                                      sizeof(token_buffer)) != SUCCESS) {
+                fprintf(stderr, "Error: Identifier is too long.\n");
+                free(tokens);
+                return NULL;
+            }
+
+            if (utils_is_sql_keyword(token_buffer)) {
+                if (utils_to_upper_copy(token_buffer, upper_buffer,
+                                        sizeof(upper_buffer)) != SUCCESS) {
+                    free(tokens);
+                    return NULL;
+                }
+                if (soft_parser_append_token(&tokens, &count, &capacity,
+                                             TOKEN_KEYWORD, upper_buffer) != SUCCESS) {
+                    free(tokens);
+                    return NULL;
+                }
+            } else {
+                if (soft_parser_append_token(&tokens, &count, &capacity,
+                                             TOKEN_IDENTIFIER, token_buffer) != SUCCESS) {
+                    free(tokens);
+                    return NULL;
+                }
+            }
+            continue;
+        }
+
+        token_buffer[0] = sql[i];
+        token_buffer[1] = '\0';
+        if (soft_parser_append_token(&tokens, &count, &capacity, TOKEN_UNKNOWN,
+                                     token_buffer) != SUCCESS) {
+            free(tokens);
+            return NULL;
+        }
+        i++;
+    }
+
+    *token_count = count;
+    return tokens;
+}
+
+Token *soft_parse(const char *sql, int *token_count) {
+    char *working_sql;
+    Token *tokens;
+    int parsed_token_count;
 
     if (sql == NULL || token_count == NULL) {
         return NULL;
@@ -153,176 +457,49 @@ Token *soft_parse(const char *sql, int *token_count) {
         return NULL;
     }
 
-    tokens = NULL;
-    count = 0;
-    capacity = 0;
-    i = 0;
-    while (working_sql[i] != '\0') {
-        if (isspace((unsigned char)working_sql[i])) {
-            i++;
-            continue;
-        }
+    tokens = soft_parser_lookup_cache(working_sql, token_count);
+    if (tokens != NULL) {
+        free(working_sql);
+        return tokens;
+    }
 
-        if (working_sql[i] == '(') {
-            if (soft_parser_append_token(&tokens, &count, &capacity, TOKEN_LPAREN,
-                                         "(") != SUCCESS) {
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-            i++;
-            continue;
-        }
+    tokens = soft_parser_tokenize_sql(working_sql, &parsed_token_count);
+    if (tokens == NULL) {
+        free(working_sql);
+        return NULL;
+    }
 
-        if (working_sql[i] == ')') {
-            if (soft_parser_append_token(&tokens, &count, &capacity, TOKEN_RPAREN,
-                                         ")") != SUCCESS) {
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-            i++;
-            continue;
-        }
-
-        if (working_sql[i] == ',') {
-            if (soft_parser_append_token(&tokens, &count, &capacity, TOKEN_COMMA,
-                                         ",") != SUCCESS) {
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-            i++;
-            continue;
-        }
-
-        if (working_sql[i] == ';') {
-            if (soft_parser_append_token(&tokens, &count, &capacity,
-                                         TOKEN_SEMICOLON, ";") != SUCCESS) {
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-            i++;
-            continue;
-        }
-
-        if (working_sql[i] == '*') {
-            if (soft_parser_append_token(&tokens, &count, &capacity,
-                                         TOKEN_IDENTIFIER, "*") != SUCCESS) {
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-            i++;
-            continue;
-        }
-
-        if (working_sql[i] == '\'' ) {
-            if (soft_parser_read_string(working_sql, &i, token_buffer,
-                                        sizeof(token_buffer)) != SUCCESS) {
-                fprintf(stderr, "Error: Unterminated string literal.\n");
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-
-            if (soft_parser_append_token(&tokens, &count, &capacity,
-                                         TOKEN_STR_LITERAL, token_buffer) != SUCCESS) {
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-            continue;
-        }
-
-        if (working_sql[i] == '!' || working_sql[i] == '<' ||
-            working_sql[i] == '>' || working_sql[i] == '=') {
-            token_buffer[0] = working_sql[i];
-            token_buffer[1] = '\0';
-            if ((working_sql[i] == '!' || working_sql[i] == '<' ||
-                 working_sql[i] == '>') && working_sql[i + 1] == '=') {
-                token_buffer[1] = '=';
-                token_buffer[2] = '\0';
-                i += 2;
-            } else {
-                i++;
-            }
-
-            if (soft_parser_append_token(&tokens, &count, &capacity,
-                                         TOKEN_OPERATOR, token_buffer) != SUCCESS) {
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-            continue;
-        }
-
-        if (soft_parser_is_numeric_start(working_sql, i)) {
-            if (soft_parser_read_number(working_sql, &i, token_buffer,
-                                        sizeof(token_buffer)) != SUCCESS) {
-                fprintf(stderr, "Error: Integer literal is too long.\n");
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-
-            if (soft_parser_append_token(&tokens, &count, &capacity,
-                                         TOKEN_INT_LITERAL, token_buffer) != SUCCESS) {
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-            continue;
-        }
-
-        if (isalpha((unsigned char)working_sql[i]) || working_sql[i] == '_') {
-            if (soft_parser_read_word(working_sql, &i, token_buffer,
-                                      sizeof(token_buffer)) != SUCCESS) {
-                fprintf(stderr, "Error: Identifier is too long.\n");
-                free(tokens);
-                free(working_sql);
-                return NULL;
-            }
-
-            if (utils_is_sql_keyword(token_buffer)) {
-                if (utils_to_upper_copy(token_buffer, upper_buffer,
-                                        sizeof(upper_buffer)) != SUCCESS) {
-                    free(tokens);
-                    free(working_sql);
-                    return NULL;
-                }
-                if (soft_parser_append_token(&tokens, &count, &capacity,
-                                             TOKEN_KEYWORD, upper_buffer) != SUCCESS) {
-                    free(tokens);
-                    free(working_sql);
-                    return NULL;
-                }
-            } else {
-                if (soft_parser_append_token(&tokens, &count, &capacity,
-                                             TOKEN_IDENTIFIER, token_buffer) != SUCCESS) {
-                    free(tokens);
-                    free(working_sql);
-                    return NULL;
-                }
-            }
-            continue;
-        }
-
-        token_buffer[0] = working_sql[i];
-        token_buffer[1] = '\0';
-        if (soft_parser_append_token(&tokens, &count, &capacity, TOKEN_UNKNOWN,
-                                     token_buffer) != SUCCESS) {
-            free(tokens);
-            free(working_sql);
-            return NULL;
-        }
-        i++;
+    *token_count = parsed_token_count;
+    if (soft_parser_store_cache(working_sql, tokens, parsed_token_count) != SUCCESS) {
+        /* Parsing already succeeded, so cache storage is treated as best-effort. */
     }
 
     free(working_sql);
-    *token_count = count;
     return tokens;
+}
+
+void soft_parser_cleanup_cache(void) {
+    SoftParserCacheEntry *entry;
+    SoftParserCacheEntry *next;
+
+    entry = soft_parser_cache_head;
+    while (entry != NULL) {
+        next = entry->next;
+        soft_parser_free_cache_entry(entry);
+        entry = next;
+    }
+
+    soft_parser_cache_head = NULL;
+    soft_parser_cache_entry_count = 0;
+    soft_parser_cache_hit_count = 0;
+}
+
+int soft_parser_get_cache_entry_count(void) {
+    return soft_parser_cache_entry_count;
+}
+
+int soft_parser_get_cache_hit_count(void) {
+    return soft_parser_cache_hit_count;
 }
 
 const char *soft_parser_token_type_name(TokenType type) {
