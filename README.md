@@ -117,6 +117,32 @@ docker build -t sql-processor .
 docker run -it --rm sql-processor bash -lc "make && ./sql_processor"
 ```
 
+## 데모 시나리오
+
+아래 SQL은 발표에서 사용한 시연 예시이다.  
+초기 점심 데이터가 저장된 상태에서 저녁 메뉴를 추가하고, 조회와 삭제가 어떻게 동작하는지 보여준다.
+
+```sql
+SELECT * FROM jungle_menu;
+
+INSERT INTO jungle_menu (slot_key, menu_date, meal_type, dish_order, dish_name) VALUES ('20260409_dinner', 20260409, 'dinner', 1, '나가사끼짬뽕');
+INSERT INTO jungle_menu (slot_key, menu_date, meal_type, dish_order, dish_name) VALUES ('20260409_dinner', 20260409, 'dinner', 2, '잡곡밥');
+INSERT INTO jungle_menu (slot_key, menu_date, meal_type, dish_order, dish_name) VALUES ('20260409_dinner', 20260409, 'dinner', 3, '나초깐풍기');
+INSERT INTO jungle_menu (slot_key, menu_date, meal_type, dish_order, dish_name) VALUES ('20260409_dinner', 20260409, 'dinner', 4, '락교무침');
+INSERT INTO jungle_menu (slot_key, menu_date, meal_type, dish_order, dish_name) VALUES ('20260409_dinner', 20260409, 'dinner', 5, '배추김치');
+
+SELECT dish_order, dish_name FROM jungle_menu WHERE slot_key = '20260409_lunch';
+SELECT dish_order, dish_name FROM jungle_menu WHERE slot_key = '20260409_dinner';
+
+SELECT menu_date, meal_type FROM jungle_menu WHERE dish_name = '깍두기';
+
+DELETE FROM jungle_menu WHERE slot_key = '20260409_dinner';
+
+SELECT dish_order, dish_name FROM jungle_menu WHERE slot_key = '20260409_dinner';
+
+exit
+```
+
 ## 테스트
 
 테스트는 네 단계로 나눴다.
