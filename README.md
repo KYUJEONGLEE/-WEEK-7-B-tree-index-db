@@ -31,6 +31,27 @@ flowchart TD
 ## 토큰 타입 분류 (tokenizer_tokenize_sql 내부 분기)
 ![tokenizer](https://github.com/user-attachments/assets/d6e03310-df0f-4e4f-8659-73f852cb8d36)
 
+# Parser (구문 분석)
+
+Tokenizer가 만든 `Token[]` 배열을 문법 규칙에 따라 소비하여 `SqlStatement` 구조체로 변환한다.
+
+## 진입점: parser_parse()
+
+```mermaid
+flowchart TD
+    A["Token 배열 입력"] --> B["parser_parse()"]
+    B --> C{"tokens[0] 키워드 확인"}
+
+    C -->|"INSERT"| D["parser_parse_insert()"]
+    C -->|"SELECT"| E["parser_parse_select()"]
+    C -->|"DELETE"| F["parser_parse_delete()"]
+    C -->|"그 외"| G["Error:\nUnsupported SQL statement"]
+
+    D --> H["SqlStatement\ntype = SQL_INSERT"]
+    E --> I["SqlStatement\ntype = SQL_SELECT"]
+    F --> J["SqlStatement\ntype = SQL_DELETE"]
+```
+
 ## 실행 엔진
 
 아래 다이어그램은 `executor.c`가 파싱된 SQL 문을 받아
