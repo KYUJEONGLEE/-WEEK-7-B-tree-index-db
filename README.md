@@ -107,7 +107,16 @@ flowchart TD
     F --> R["storage_delete() 호출"]
     R --> S["N rows deleted 출력"]
 ```
----
+
+## Docker 실행
+
+프로젝트 루트 디렉터리에서 아래 명령으로 이미지를 빌드하고 실행합니다.
+
+```bash
+docker build -t sql-processor .
+docker run -it --rm sql-processor bash -lc "make && ./sql_processor"
+```
+
 ## 테스트
 
 테스트는 네 단계로 나눴다.
