@@ -1,3 +1,5 @@
+<img width="500" height="500" alt="qrcode_330735753_87394ba2d91fc91edec44909f936e3c9" src="https://github.com/user-attachments/assets/02ce8c7c-a851-4c99-8764-86c63091c5c5" />
+
 ## 프로젝트 개요
 > 이 프로젝트는 C 언어로 구현한 간단한 SQL 처리기(SQL Processor)입니다. </br>
 > 사용자로부터 SQL 쿼리를 입력받아 파싱하고, 이를 실행하여 CSV 파일 기반 저장소에 반영합니다.
