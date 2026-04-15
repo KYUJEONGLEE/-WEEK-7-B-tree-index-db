@@ -1,5 +1,6 @@
 #include "executor.h"
 #include "parser.h"
+#include "storage.h"
 #include "tokenizer.h"
 #include "utils.h"
 
@@ -25,19 +26,20 @@ static size_t main_skip_whitespace(const char *text, size_t index)
  * 완전한 SQL 문 하나를 파싱하고 실행한다.
  * 빈 문장이거나 정상 실행되면 SUCCESS를 반환한다.
  */
-static int main_process_sql_statement(const char *sql)
+static int main_parse_sql_statement(const char *sql, SqlStatement *statement,
+                                    int *is_empty)
 {
     Token *tokens;
     int token_count;
-    SqlStatement statement;
     char *working_sql;
     int status;
 
-    if (sql == NULL)
+    if (sql == NULL || statement == NULL || is_empty == NULL)
     {
         return FAILURE;
     }
 
+    *is_empty = 0;
     working_sql = utils_strdup(sql);
     if (working_sql == NULL)
     {
@@ -48,6 +50,7 @@ static int main_process_sql_statement(const char *sql)
     if (working_sql[0] == '\0')
     {
         free(working_sql);
+        *is_empty = 1;
         return SUCCESS;
     }
 
@@ -59,15 +62,30 @@ static int main_process_sql_statement(const char *sql)
         return FAILURE;
     }
 
-    status = parser_parse(tokens, token_count, &statement);
-    if (status == SUCCESS)
-    {
-        status = executor_execute(&statement);
-    }
+    status = parser_parse(tokens, token_count, statement);
 
     free(tokens);
     free(working_sql);
     return status;
+}
+
+/*
+ * 완전한 SQL 문 하나를 파싱하고 실행한다.
+ * 빈 문장이거나 정상 실행되면 SUCCESS를 반환한다.
+ */
+static int main_process_sql_statement(const char *sql)
+{
+    SqlStatement statement;
+    int is_empty;
+    int status;
+
+    status = main_parse_sql_statement(sql, &statement, &is_empty);
+    if (status != SUCCESS || is_empty)
+    {
+        return status;
+    }
+
+    return executor_execute(&statement);
 }
 
 /*
@@ -130,6 +148,130 @@ static int main_run_file_mode(const char *path)
 
     free(content);
     return SUCCESS;
+}
+
+/*
+ * players INSERT 전용 bulk 파일 모드.
+ * SQL 문법은 그대로 파싱하되 CSV 파일은 한 번만 열고 meta는 마지막에 한 번만 갱신한다.
+ */
+static int main_run_bulk_insert_mode(const char *path, int silent)
+{
+    char *content;
+    size_t start;
+    int terminator_index;
+    char *statement_sql;
+    char *remaining;
+    SqlStatement statement;
+    PlayersBulkInsert bulk;
+    int is_empty;
+    int bulk_started;
+    int status;
+
+    content = utils_read_file(path);
+    if (content == NULL)
+    {
+        return FAILURE;
+    }
+
+    memset(&bulk, 0, sizeof(bulk));
+    bulk_started = 0;
+    status = SUCCESS;
+
+    start = 0;
+    while (content[start] != '\0')
+    {
+        start = main_skip_whitespace(content, start);
+        if (content[start] == '\0')
+        {
+            break;
+        }
+
+        terminator_index = utils_find_statement_terminator(content, start);
+        if (terminator_index == FAILURE)
+        {
+            remaining = utils_strdup(content + start);
+            if (remaining == NULL)
+            {
+                status = FAILURE;
+                break;
+            }
+            utils_trim(remaining);
+            if (remaining[0] != '\0')
+            {
+                fprintf(stderr, "Error: Missing semicolon at end of SQL statement.\n");
+                status = FAILURE;
+            }
+            free(remaining);
+            break;
+        }
+
+        statement_sql = utils_substring(content, start,
+                                        (size_t)terminator_index - start + 1);
+        if (statement_sql == NULL)
+        {
+            status = FAILURE;
+            break;
+        }
+
+        status = main_parse_sql_statement(statement_sql, &statement, &is_empty);
+        free(statement_sql);
+        if (status != SUCCESS)
+        {
+            break;
+        }
+
+        if (!is_empty)
+        {
+            if (statement.type != SQL_INSERT ||
+                !utils_equals_ignore_case(statement.insert.table_name, "players"))
+            {
+                fprintf(stderr,
+                        "Error: --bulk-insert only supports INSERT INTO players statements.\n");
+                status = FAILURE;
+                break;
+            }
+
+            if (!bulk_started)
+            {
+                if (storage_players_bulk_begin(statement.insert.table_name,
+                                               &bulk) != SUCCESS)
+                {
+                    status = FAILURE;
+                    break;
+                }
+                bulk_started = 1;
+            }
+
+            if (storage_players_bulk_insert(&bulk, &statement.insert) != SUCCESS)
+            {
+                status = FAILURE;
+                break;
+            }
+        }
+
+        start = (size_t)terminator_index + 1;
+    }
+
+    free(content);
+
+    if (bulk_started)
+    {
+        if (status == SUCCESS)
+        {
+            status = storage_players_bulk_finish(&bulk);
+            if (status == SUCCESS && !silent)
+            {
+                printf("[성공] players 테이블에 %ld행을 bulk INSERT했습니다.\n",
+                       bulk.inserted_count);
+            }
+        }
+        else
+        {
+            storage_players_bulk_abort(&bulk);
+        }
+    }
+
+    return status;
 }
 
 /*
@@ -272,12 +414,14 @@ int main(int argc, char *argv[])
     const char *sql_file;
     int silent;
     int summary_only;
+    int bulk_insert;
     ExecMode mode;
     int i;
 
     sql_file = NULL;
     silent = 0;
     summary_only = 0;
+    bulk_insert = 0;
     mode = EXEC_MODE_NORMAL;
 
     for (i = 1; i < argc; i++)
@@ -289,6 +433,10 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "--summary-only") == 0)
         {
             summary_only = 1;
+        }
+        else if (strcmp(argv[i], "--bulk-insert") == 0)
+        {
+            bulk_insert = 1;
         }
         else if (strcmp(argv[i], "--force-linear") == 0)
         {
@@ -309,7 +457,7 @@ int main(int argc, char *argv[])
         else
         {
             fprintf(stderr,
-                    "Usage: %s [--silent] [--summary-only] [--force-linear|--force-id-index|--force-win-index] [sql_file]\n",
+                    "Usage: %s [--silent] [--summary-only] [--bulk-insert] [--force-linear|--force-id-index|--force-win-index] [sql_file]\n",
                     argv[0]);
             return EXIT_FAILURE;
         }
@@ -319,7 +467,16 @@ int main(int argc, char *argv[])
     executor_set_summary_only(summary_only);
     executor_set_mode(mode);
 
-    if (sql_file != NULL)
+    if (bulk_insert && sql_file == NULL)
+    {
+        fprintf(stderr, "Error: --bulk-insert requires a SQL file.\n");
+        status = FAILURE;
+    }
+    else if (bulk_insert)
+    {
+        status = main_run_bulk_insert_mode(sql_file, silent);
+    }
+    else if (sql_file != NULL)
     {
         status = main_run_file_mode(sql_file);
     }

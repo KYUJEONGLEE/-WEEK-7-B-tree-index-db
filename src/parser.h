@@ -28,6 +28,8 @@ typedef struct {
     char columns[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
     int has_where;
     WhereClause where;
+    int has_second_where;
+    WhereClause second_where;
 } SelectStatement;
 
 typedef struct {

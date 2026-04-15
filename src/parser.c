@@ -282,6 +282,107 @@ static int parser_parse_where(const Token *tokens, int token_count, int *index,
     return SUCCESS;
 }
 
+static int parser_is_literal_token(const Token *tokens, int token_count, int index) {
+    return parser_is_token(tokens, token_count, index, TOKEN_INT_LITERAL, NULL) ||
+           parser_is_token(tokens, token_count, index, TOKEN_STR_LITERAL, NULL);
+}
+
+static int parser_invert_operator(const char *op, char *dest, size_t dest_size) {
+    const char *inverted;
+
+    if (op == NULL || dest == NULL) {
+        return FAILURE;
+    }
+
+    if (strcmp(op, "<") == 0) {
+        inverted = ">";
+    } else if (strcmp(op, "<=") == 0) {
+        inverted = ">=";
+    } else if (strcmp(op, ">") == 0) {
+        inverted = "<";
+    } else if (strcmp(op, ">=") == 0) {
+        inverted = "<=";
+    } else {
+        parser_print_error("Unsupported chained WHERE operator.");
+        return FAILURE;
+    }
+
+    if (utils_safe_strcpy(dest, dest_size, inverted) != SUCCESS) {
+        parser_print_error("WHERE operator is invalid.");
+        return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
+/*
+ * SELECT 전용 WHERE 절을 파싱한다.
+ * 일반 `column op value` 조건과 `value op column op value` 범위 조건을 지원한다.
+ */
+static int parser_parse_select_where(const Token *tokens, int token_count,
+                                     int *index, SelectStatement *stmt) {
+    char left_value[MAX_VALUE_LEN];
+    char first_op[4];
+
+    if (parser_is_literal_token(tokens, token_count, *index)) {
+        if (parser_expect_literal(tokens, token_count, index, left_value,
+                                  sizeof(left_value)) != SUCCESS) {
+            return FAILURE;
+        }
+
+        if (!parser_is_token(tokens, token_count, *index, TOKEN_OPERATOR, NULL)) {
+            parser_print_error("Expected operator in WHERE clause.");
+            return FAILURE;
+        }
+        if (utils_safe_strcpy(first_op, sizeof(first_op),
+                              tokens[*index].value) != SUCCESS) {
+            parser_print_error("WHERE operator is invalid.");
+            return FAILURE;
+        }
+        (*index)++;
+
+        if (parser_expect_identifier(tokens, token_count, index,
+                                     stmt->where.column,
+                                     sizeof(stmt->where.column)) != SUCCESS) {
+            return FAILURE;
+        }
+
+        if (!parser_is_token(tokens, token_count, *index, TOKEN_OPERATOR, NULL)) {
+            parser_print_error("Expected second operator in chained WHERE clause.");
+            return FAILURE;
+        }
+
+        if (parser_invert_operator(first_op, stmt->where.op,
+                                   sizeof(stmt->where.op)) != SUCCESS ||
+            utils_safe_strcpy(stmt->where.value, sizeof(stmt->where.value),
+                              left_value) != SUCCESS) {
+            return FAILURE;
+        }
+
+        if (utils_safe_strcpy(stmt->second_where.column,
+                              sizeof(stmt->second_where.column),
+                              stmt->where.column) != SUCCESS ||
+            utils_safe_strcpy(stmt->second_where.op,
+                              sizeof(stmt->second_where.op),
+                              tokens[*index].value) != SUCCESS) {
+            parser_print_error("WHERE clause is invalid.");
+            return FAILURE;
+        }
+        (*index)++;
+
+        if (parser_expect_literal(tokens, token_count, index,
+                                  stmt->second_where.value,
+                                  sizeof(stmt->second_where.value)) != SUCCESS) {
+            return FAILURE;
+        }
+
+        stmt->has_second_where = 1;
+        return SUCCESS;
+    }
+
+    return parser_parse_where(tokens, token_count, index, &stmt->where);
+}
+
 /*
  * SELECT 토큰 흐름을 SelectStatement 구조체로 파싱한다.
  */
@@ -315,8 +416,8 @@ static int parser_parse_select(const Token *tokens, int token_count,
     if (parser_is_token(tokens, token_count, index, TOKEN_KEYWORD, "WHERE")) {
         out->select.has_where = 1;
         index++;
-        if (parser_parse_where(tokens, token_count, &index,
-                                    &out->select.where) != SUCCESS) {
+        if (parser_parse_select_where(tokens, token_count, &index,
+                                      &out->select) != SUCCESS) {
             return FAILURE;
         }
     }

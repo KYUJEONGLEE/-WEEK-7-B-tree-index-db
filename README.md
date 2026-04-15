@@ -11,6 +11,29 @@ SQL 문법은 새로 만들지 않았습니다. 기존처럼 `SELECT ... WHERE c
 
 ---
 
+## 프로젝트 핵심
+
+이 프로젝트는 완성형 DBMS를 만드는 것이 아니라, SQL 처리 흐름 안에 인덱스가 어떻게 들어가는지 확인하는 데 초점을 둡니다.
+
+| 구분 | 내용 |
+| --- | --- |
+| 저장 방식 | `data/<table>.csv` 파일 기반 저장 |
+| SQL 처리 | tokenizer, parser, executor 단계 분리 |
+| 기존 조회 | WHERE 조건을 만족할 때까지 row를 순서대로 검사 |
+| 개선 조회 | `players.id`, `players.game_win_count`에 B+ 트리 인덱스 적용 |
+| 비교 방식 | 같은 SELECT를 선형 탐색 또는 B+ 트리로 강제 실행 가능 |
+| 관찰 지표 | 실행 계획, 결과 행 수, 검사 행 수, 소요 시간 |
+
+시각 자료:
+
+| 자료 | 파일 |
+| --- | --- |
+| SQL 실행 파이프라인 | `docs/assets/sql_pipeline.svg` |
+| `players` 인덱스 매핑 | `docs/assets/index_mapping.svg` |
+| B+ 트리 leaf scan | `docs/assets/bptree_leaf_scan.svg` |
+
+---
+
 ## 구현 목표
 
 기존 구조에서 `SELECT ... WHERE ...` 조건은 테이블을 처음부터 끝까지 확인하는 선형 탐색 방식으로 처리했습니다. 선형 탐색은 단순하지만, 데이터가 100만 건 이상으로 늘어나면 조건에 맞는 row를 찾기 위해 많은 row를 검사해야 합니다.
@@ -57,6 +80,8 @@ id,nickname,game_win_count,game_loss_count,total_game_count
 
 ## 전체 실행 흐름
 
+![SQL 실행 파이프라인](docs/assets/sql_pipeline.svg)
+
 ```text
 SQL 입력
 -> tokenizer
@@ -71,15 +96,26 @@ SQL 입력
 | 파일 | 역할 |
 | --- | --- |
 | `src/main.c` | REPL/파일 모드, 실행 옵션 처리 |
+| `src/tokenizer.c` | SQL 문자열을 토큰으로 분리 |
+| `src/parser.c` | 토큰을 SQL statement 구조체로 변환 |
 | `src/parser.h` | SQL 구조체 정의 |
 | `src/executor.c` | 실행 계획 선택, SELECT/INSERT/DELETE 실행 |
 | `src/storage.c` | CSV 읽기/쓰기, players INSERT, meta id 관리 |
 | `src/bptree.c` | B+ 트리 코어 |
 | `src/index.c` | `players` 전용 B+ 트리 index manager |
 
+SELECT 실행에서 중요한 지점은 executor입니다. parser가 만든 `SelectStatement`는 동일하지만, executor는 WHERE 컬럼과 연산자를 확인한 뒤 다음 중 하나를 선택합니다.
+
+- 전체 조회
+- 선형 탐색
+- ID B+ 트리 조회
+- 승리 횟수 B+ 트리 조회
+
 ---
 
 ## B+ 트리 설계
+
+![B+ 트리 leaf scan](docs/assets/bptree_leaf_scan.svg)
 
 B+ 트리 코어는 `src/bptree.h`, `src/bptree.c`에 있습니다.
 
@@ -100,9 +136,21 @@ BPTreeNode
 
 현재 `BPTreeNode`에는 `prev` 포인터가 없고 `next` 포인터만 있습니다. 따라서 leaf scan은 왼쪽에서 오른쪽 방향으로 수행합니다.
 
+구현 단위:
+
+| 함수 | 역할 |
+| --- | --- |
+| `bptree_find_leaf()` | key가 위치할 leaf node 탐색 |
+| `bptree_search()` | leaf 안에서 exact key 검색 |
+| `bptree_insert()` | 중복 key 확인 후 leaf에 삽입 |
+| `bptree_insert_into_parent()` | split 후 부모 노드에 separator 반영 |
+| `bptree_collect_stats()` | 트리 높이, node 수, leaf 수, key 수 수집 |
+
 ---
 
 ## Index Manager 설계
+
+![players 인덱스 매핑](docs/assets/index_mapping.svg)
 
 `src/index.h`, `src/index.c`는 B+ 트리를 직접 사용하는 index manager입니다.
 
@@ -130,6 +178,16 @@ typedef struct {
 이렇게 바꾼 이유는 범위 조회나 중복 key 조회에서 파일을 여러 번 다시 읽는 비용을 줄이기 위해서입니다.
 
 참고로 `OffsetNode`, `OffsetList`라는 이름은 남아 있지만, 현재 내부에 저장되는 값은 파일 offset이 아니라 `int row_index`입니다.
+
+index manager는 B+ 트리 코어를 `players` 테이블에 맞게 감싸는 계층입니다. B+ 트리 자체는 `long long key -> void *value`만 알고, 어떤 컬럼을 인덱스로 쓸지, 중복 key를 어떻게 저장할지는 `src/index.c`에서 처리합니다.
+
+| 함수 | 역할 |
+| --- | --- |
+| `index_build_player_indexes()` | `TableData` 전체를 읽어 `id_tree`, `win_tree` 생성 |
+| `index_insert_row()` | 한 row의 `id`, `game_win_count`를 두 인덱스에 반영 |
+| `index_search_by_id()` | `id` exact lookup 후 row index 반환 |
+| `index_search_by_win_count()` | `game_win_count` exact lookup 후 list 반환 |
+| `index_collect_win_count_row_indexes()` | `=`, `<`, `<=`, `>`, `>=` 조건에 맞는 row index 수집 |
 
 ---
 
@@ -213,6 +271,7 @@ exit
 | `--force-win-index` | `game_win_count` 조건을 승리 횟수 B+트리로 강제 |
 | `--summary-only` | SELECT 결과 표 생략, 요약만 출력 |
 | `--silent` | INSERT/SELECT/DELETE 출력 제거 |
+| `--bulk-insert` | `players` INSERT SQL 파일을 bulk 경로로 처리 |
 
 `--summary-only`는 결과 표를 생략하고 실행 계획, 결과 행 수, 검사 행 수, 소요 시간만 출력합니다.
 
@@ -296,6 +355,12 @@ total_game_count: game_win_count + game_loss_count
 
 ```bash
 ./sql_processor --silent bench/insert_1m_players.sql
+```
+
+`players` 전용 대량 INSERT는 `--bulk-insert` 옵션으로 더 빠르게 처리할 수 있습니다. 이 경로는 SQL 문법은 그대로 파싱하지만, CSV 파일을 한 번만 열고 `players.meta`는 마지막에 한 번만 갱신합니다.
+
+```bash
+./sql_processor --bulk-insert --silent bench/insert_1m_players.sql
 ```
 
 참고: `bench/insert_1m_players.sql`은 100MB가 넘어서 Git에는 올리지 않았습니다. 대신 실제 데이터 파일인 `data/players.csv`를 저장소에 포함했습니다.

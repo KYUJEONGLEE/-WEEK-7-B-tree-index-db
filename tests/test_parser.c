@@ -66,6 +66,39 @@ int main(void) {
     free(tokens);
 
     tokens = tokenizer_tokenize(
+        "SELECT * FROM players WHERE 50 < game_win_count < 60;",
+        &token_count);
+    if (tokens == NULL) {
+        return EXIT_FAILURE;
+    }
+
+    if (assert_true(parser_parse(tokens, token_count, &statement) == SUCCESS,
+                    "parser_parse should parse chained range SELECT") != SUCCESS ||
+        assert_true(statement.type == SQL_SELECT,
+                    "chained range statement type should be SELECT") != SUCCESS ||
+        assert_true(statement.select.has_where == 1,
+                    "chained range should set first WHERE") != SUCCESS ||
+        assert_true(statement.select.has_second_where == 1,
+                    "chained range should set second WHERE") != SUCCESS ||
+        assert_true(strcmp(statement.select.where.column, "game_win_count") == 0,
+                    "first chained WHERE column should be game_win_count") != SUCCESS ||
+        assert_true(strcmp(statement.select.where.op, ">") == 0,
+                    "left chained operator should be normalized to >") != SUCCESS ||
+        assert_true(strcmp(statement.select.where.value, "50") == 0,
+                    "left chained value should be 50") != SUCCESS ||
+        assert_true(strcmp(statement.select.second_where.column,
+                           "game_win_count") == 0,
+                    "second chained WHERE column should be game_win_count") != SUCCESS ||
+        assert_true(strcmp(statement.select.second_where.op, "<") == 0,
+                    "second chained operator should stay <") != SUCCESS ||
+        assert_true(strcmp(statement.select.second_where.value, "60") == 0,
+                    "second chained value should be 60") != SUCCESS) {
+        free(tokens);
+        return EXIT_FAILURE;
+    }
+    free(tokens);
+
+    tokens = tokenizer_tokenize(
         "DELETE FROM users WHERE name = 'Alice';",
         &token_count);
     if (tokens == NULL) {

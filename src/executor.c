@@ -573,8 +573,10 @@ static int executor_collect_linear_rows(const SelectStatement *stmt,
                                         char ****out_rows, int *out_row_count,
                                         long *scanned_rows) {
     int where_index;
+    int second_where_index;
     int i;
     int matches;
+    int second_matches;
     char ***result_rows;
 
     if (stmt == NULL || table == NULL || selected_indices == NULL ||
@@ -587,6 +589,18 @@ static int executor_collect_linear_rows(const SelectStatement *stmt,
     if (where_index == FAILURE) {
         fprintf(stderr, "Error: Column '%s' not found.\n", stmt->where.column);
         return FAILURE;
+    }
+
+    second_where_index = FAILURE;
+    if (stmt->has_second_where) {
+        second_where_index = executor_find_column_index(table->columns,
+                                                        table->col_count,
+                                                        stmt->second_where.column);
+        if (second_where_index == FAILURE) {
+            fprintf(stderr, "Error: Column '%s' not found.\n",
+                    stmt->second_where.column);
+            return FAILURE;
+        }
     }
 
     if (executor_allocate_result_rows(&result_rows, table->row_count) != SUCCESS) {
@@ -613,6 +627,22 @@ static int executor_collect_linear_rows(const SelectStatement *stmt,
 
         if (!matches) {
             continue;
+        }
+
+        if (stmt->has_second_where) {
+            second_matches = executor_compare_with_operator(
+                table->rows[i][second_where_index],
+                stmt->second_where.op,
+                stmt->second_where.value);
+            if (second_matches == FAILURE) {
+                executor_free_result_rows(result_rows, *out_row_count,
+                                          selected_count);
+                return FAILURE;
+            }
+
+            if (!second_matches) {
+                continue;
+            }
         }
 
         if (executor_copy_projected_row(result_rows, *out_row_count, table->rows[i],
@@ -704,7 +734,10 @@ static int executor_collect_win_indexed_rows(const SelectStatement *stmt,
     int *row_indexes;
     char ***result_rows;
     int i;
+    int second_where_index;
+    int second_matches;
     int row_index_count;
+    int copied_count;
 
     if (stmt == NULL || table == NULL || indexes == NULL ||
         out_rows == NULL || out_row_count == NULL) {
@@ -732,29 +765,61 @@ static int executor_collect_win_indexed_rows(const SelectStatement *stmt,
         return SUCCESS;
     }
 
+    second_where_index = FAILURE;
+    if (stmt->has_second_where) {
+        second_where_index = executor_find_column_index(table->columns,
+                                                        table->col_count,
+                                                        stmt->second_where.column);
+        if (second_where_index == FAILURE) {
+            fprintf(stderr, "Error: Column '%s' not found.\n",
+                    stmt->second_where.column);
+            free(row_indexes);
+            return FAILURE;
+        }
+    }
+
     if (executor_allocate_result_rows(&result_rows, row_index_count) != SUCCESS) {
         free(row_indexes);
         return FAILURE;
     }
 
+    copied_count = 0;
     for (i = 0; i < row_index_count; i++) {
         if (row_indexes[i] < 0 || row_indexes[i] >= table->row_count) {
-            executor_free_result_rows(result_rows, i, selected_count);
+            executor_free_result_rows(result_rows, copied_count, selected_count);
             free(row_indexes);
             return FAILURE;
         }
 
-        if (executor_copy_projected_row(result_rows, i, table->rows[row_indexes[i]],
+        if (stmt->has_second_where) {
+            second_matches = executor_compare_with_operator(
+                table->rows[row_indexes[i]][second_where_index],
+                stmt->second_where.op,
+                stmt->second_where.value);
+            if (second_matches == FAILURE) {
+                executor_free_result_rows(result_rows, copied_count, selected_count);
+                free(row_indexes);
+                return FAILURE;
+            }
+
+            if (!second_matches) {
+                continue;
+            }
+        }
+
+        if (executor_copy_projected_row(result_rows, copied_count,
+                                        table->rows[row_indexes[i]],
                                         selected_indices, selected_count) != SUCCESS) {
-            executor_free_result_rows(result_rows, i, selected_count);
+            executor_free_result_rows(result_rows, copied_count, selected_count);
             free(row_indexes);
             return FAILURE;
         }
+        copied_count++;
     }
 
     free(row_indexes);
     *out_rows = result_rows;
-    *out_row_count = row_index_count;
+    *out_row_count = copied_count;
     return SUCCESS;
 }
 
@@ -799,7 +864,8 @@ static ExecPlan executor_choose_select_plan(const SelectStatement *stmt,
     }
 
     if (mode == EXEC_MODE_FORCE_ID_INDEX) {
-        if (strcmp(stmt->where.op, "=") == 0 &&
+        if (!stmt->has_second_where &&
+            strcmp(stmt->where.op, "=") == 0 &&
             utils_equals_ignore_case(stmt->where.column, "id")) {
             return EXEC_PLAN_BPTREE_ID_LOOKUP;
         }
@@ -817,7 +883,8 @@ static ExecPlan executor_choose_select_plan(const SelectStatement *stmt,
      * 일반 SQL 실행에서는 id exact match와 game_win_count 조건을 B+ 트리로 보낸다.
      * 다른 컬럼은 의도적으로 선형 탐색을 사용해 스펙의 비교 기준을 명확히 한다.
      */
-    if (strcmp(stmt->where.op, "=") == 0 &&
+    if (!stmt->has_second_where &&
+        strcmp(stmt->where.op, "=") == 0 &&
         utils_equals_ignore_case(stmt->where.column, "id")) {
         return EXEC_PLAN_BPTREE_ID_LOOKUP;
     }

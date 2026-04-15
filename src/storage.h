@@ -3,6 +3,8 @@
 
 #include "parser.h"
 
+#include <stdio.h>
+
 typedef struct {
     int row_count;
     int col_count;
@@ -11,11 +13,41 @@ typedef struct {
     long *offsets;
 } TableData;
 
+typedef struct {
+    FILE *fp;
+    char table_name[MAX_IDENTIFIER_LEN];
+    long long next_id;
+    long inserted_count;
+    int active;
+} PlayersBulkInsert;
+
 /*
  * 테이블 CSV 파일에 행 하나를 추가한다.
  * 성공 시 SUCCESS, 실패 시 FAILURE를 반환한다.
  */
 int storage_insert(const char *table_name, const InsertStatement *stmt);
+
+/*
+ * players 전용 bulk INSERT 세션을 시작한다.
+ * CSV 파일은 한 번만 열고, meta는 finish 시점에 한 번만 갱신한다.
+ */
+int storage_players_bulk_begin(const char *table_name, PlayersBulkInsert *bulk);
+
+/*
+ * 열린 players bulk 세션에 INSERT 한 행을 append한다.
+ */
+int storage_players_bulk_insert(PlayersBulkInsert *bulk,
+                                const InsertStatement *stmt);
+
+/*
+ * bulk INSERT 세션을 정상 종료하고 meta 파일을 갱신한다.
+ */
+int storage_players_bulk_finish(PlayersBulkInsert *bulk);
+
+/*
+ * bulk INSERT 세션을 닫는다. 이미 쓴 row가 있으면 meta를 현재 next_id로 맞춘다.
+ */
+void storage_players_bulk_abort(PlayersBulkInsert *bulk);
 
 /*
  * 테이블 CSV 파일에서 조건에 맞는 행을 삭제한다.

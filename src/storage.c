@@ -1331,6 +1331,184 @@ static int storage_insert_players(const char *table_name, const InsertStatement 
     return SUCCESS;
 }
 
+int storage_players_bulk_begin(const char *table_name, PlayersBulkInsert *bulk) {
+    static const char *headers[] = {
+        "id", "nickname", "game_win_count", "game_loss_count",
+        "total_game_count"
+    };
+    char path[MAX_PATH_LEN];
+    char existing_columns[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
+    char next_id_value[MAX_VALUE_LEN];
+    int existing_count;
+
+    if (table_name == NULL || bulk == NULL ||
+        !utils_equals_ignore_case(table_name, "players")) {
+        return FAILURE;
+    }
+
+    memset(bulk, 0, sizeof(*bulk));
+    if (utils_safe_strcpy(bulk->table_name, sizeof(bulk->table_name),
+                          table_name) != SUCCESS ||
+        storage_ensure_data_dir() != SUCCESS ||
+        storage_build_path(table_name, path, sizeof(path)) != SUCCESS) {
+        return FAILURE;
+    }
+
+    bulk->fp = fopen(path, "a+");
+    if (bulk->fp == NULL) {
+        fprintf(stderr, "Error: Failed to open table '%s'.\n", table_name);
+        return FAILURE;
+    }
+
+    if (storage_lock_file(bulk->fp, LOCK_EX) != SUCCESS) {
+        fclose(bulk->fp);
+        memset(bulk, 0, sizeof(*bulk));
+        return FAILURE;
+    }
+
+    rewind(bulk->fp);
+    if (storage_read_header(bulk->fp, existing_columns, &existing_count) != SUCCESS) {
+        storage_players_bulk_abort(bulk);
+        return FAILURE;
+    }
+
+    if (existing_count == 0) {
+        if (storage_write_csv_row(bulk->fp, headers, 5) != SUCCESS) {
+            fprintf(stderr, "Error: Failed to write players header.\n");
+            storage_players_bulk_abort(bulk);
+            return FAILURE;
+        }
+        bulk->next_id = 1;
+    } else {
+        if (storage_validate_players_header(existing_columns, existing_count) != SUCCESS) {
+            fprintf(stderr, "Error: players table schema is invalid.\n");
+            storage_players_bulk_abort(bulk);
+            return FAILURE;
+        }
+
+        if (storage_get_meta_next_auto_id(bulk->fp, table_name, existing_columns,
+                                          existing_count, next_id_value,
+                                          sizeof(next_id_value)) != SUCCESS) {
+            storage_players_bulk_abort(bulk);
+            return FAILURE;
+        }
+        bulk->next_id = utils_parse_integer(next_id_value);
+    }
+
+    if (fseek(bulk->fp, 0, SEEK_END) != 0) {
+        fprintf(stderr, "Error: Failed to append to table '%s'.\n", table_name);
+        storage_players_bulk_abort(bulk);
+        return FAILURE;
+    }
+
+    bulk->active = 1;
+    return SUCCESS;
+}
+
+int storage_players_bulk_insert(PlayersBulkInsert *bulk,
+                                const InsertStatement *stmt) {
+    int nickname_index;
+    int win_index;
+    int loss_index;
+    long long wins;
+    long long losses;
+    long long total;
+    char id_value[MAX_VALUE_LEN];
+    char win_value[MAX_VALUE_LEN];
+    char loss_value[MAX_VALUE_LEN];
+    char total_value[MAX_VALUE_LEN];
+    const char *ordered_values[5];
+
+    if (bulk == NULL || stmt == NULL || bulk->fp == NULL || !bulk->active ||
+        !utils_equals_ignore_case(stmt->table_name, "players")) {
+        return FAILURE;
+    }
+
+    nickname_index = storage_find_statement_column(stmt, "nickname");
+    win_index = storage_find_statement_column(stmt, "game_win_count");
+    loss_index = storage_find_statement_column(stmt, "game_loss_count");
+    if (nickname_index == FAILURE || win_index == FAILURE ||
+        loss_index == FAILURE) {
+        fprintf(stderr,
+                "Error: players INSERT requires nickname, game_win_count, and game_loss_count.\n");
+        return FAILURE;
+    }
+
+    if (!utils_is_integer(stmt->values[win_index]) ||
+        !utils_is_integer(stmt->values[loss_index])) {
+        fprintf(stderr, "Error: game counts must be integer values.\n");
+        return FAILURE;
+    }
+
+    wins = utils_parse_integer(stmt->values[win_index]);
+    losses = utils_parse_integer(stmt->values[loss_index]);
+    total = wins + losses;
+
+    snprintf(id_value, sizeof(id_value), "%lld", bulk->next_id);
+    snprintf(win_value, sizeof(win_value), "%lld", wins);
+    snprintf(loss_value, sizeof(loss_value), "%lld", losses);
+    snprintf(total_value, sizeof(total_value), "%lld", total);
+
+    ordered_values[0] = id_value;
+    ordered_values[1] = stmt->values[nickname_index];
+    ordered_values[2] = win_value;
+    ordered_values[3] = loss_value;
+    ordered_values[4] = total_value;
+
+    if (storage_write_csv_row(bulk->fp, ordered_values, 5) != SUCCESS) {
+        fprintf(stderr, "Error: Failed to write table '%s'.\n", bulk->table_name);
+        return FAILURE;
+    }
+
+    bulk->next_id++;
+    bulk->inserted_count++;
+    return SUCCESS;
+}
+
+int storage_players_bulk_finish(PlayersBulkInsert *bulk) {
+    int status;
+
+    if (bulk == NULL || bulk->fp == NULL || !bulk->active) {
+        return FAILURE;
+    }
+
+    status = SUCCESS;
+    if (fflush(bulk->fp) != 0) {
+        status = FAILURE;
+    }
+
+    flock(fileno(bulk->fp), LOCK_UN);
+    fclose(bulk->fp);
+    bulk->fp = NULL;
+    bulk->active = 0;
+
+    if (status == SUCCESS &&
+        storage_write_meta_next_id(bulk->table_name, bulk->next_id) != SUCCESS) {
+        status = FAILURE;
+    }
+
+    return status;
+}
+
+void storage_players_bulk_abort(PlayersBulkInsert *bulk) {
+    if (bulk == NULL) {
+        return;
+    }
+
+    if (bulk->fp != NULL) {
+        fflush(bulk->fp);
+        flock(fileno(bulk->fp), LOCK_UN);
+        fclose(bulk->fp);
+        bulk->fp = NULL;
+    }
+
+    if (bulk->active && bulk->inserted_count > 0) {
+        storage_write_meta_next_id(bulk->table_name, bulk->next_id);
+    }
+
+    bulk->active = 0;
+}
+
 /*
  * 행 하나를 테이블에 삽입한다.
  * 필요하면 CSV 파일과 스키마를 만들고 auto-increment id와 기본 키 검사를 처리한다.

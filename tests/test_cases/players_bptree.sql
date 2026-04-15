@@ -3,6 +3,7 @@ INSERT INTO players (nickname, game_win_count, game_loss_count) VALUES ('player_
 INSERT INTO players (nickname, game_win_count, game_loss_count) VALUES ('player_3', 20, 1);
 SELECT nickname FROM players WHERE id = 2;
 SELECT nickname FROM players WHERE game_win_count = 10;
+SELECT nickname FROM players WHERE 9 < game_win_count < 21;
 SELECT nickname FROM players WHERE nickname = 'player_3';
 DELETE FROM players WHERE nickname = 'player_2';
 SELECT nickname FROM players WHERE id = 2;
