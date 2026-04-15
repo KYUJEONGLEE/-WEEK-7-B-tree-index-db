@@ -1,199 +1,267 @@
-# 7조 B+트리 인덱스 발표 README
+# Mini SQL Processor - B+ Tree Index
 
-이 브랜치는 발표 준비용 브랜치입니다. README는 코드 설명 문서라기보다, 발표 때 바로 보고 말할 수 있는 **4분 발표 대본 + 데모 순서**로 구성했습니다.
+이 프로젝트는 C로 구현한 간단한 SQL 처리기입니다. 기존 `INSERT`, `SELECT`, `DELETE`, CSV 저장소, REPL/파일 실행 흐름을 유지하면서 이번 과제 범위인 **메모리 기반 B+ 트리 인덱스**를 추가했습니다.
 
----
+이번 구현의 핵심은 `players` 테이블에 대해 두 개의 B+ 트리 인덱스를 제공하는 것입니다.
 
-## 발표 핵심 요약
+- `id` 인덱스
+- `game_win_count` 인덱스
 
-- 기존 SQL 처리기는 `SELECT ... WHERE ...` 조건을 선형 탐색으로 처리했습니다.
-- 100만 건 데이터에서는 선형 탐색의 `O(n)` 비용이 커집니다.
-- 이번 구현에서는 `id`, `game_win_count`에 대해 메모리 기반 B+트리 인덱스를 추가했습니다.
-- 현재 B+트리는 디스크에 저장되는 영구 인덱스가 아니라, 프로그램 실행 중 메모리에 만들어지는 인덱스입니다.
-- B+트리 value에는 파일 offset이 아니라 `row_index`를 저장합니다.
-- `id = ?`처럼 결과가 1건인 조회에서는 B+트리가 유리합니다.
-- 조건에 맞는 row가 많은 조회에서는 B+트리가 항상 빠르지는 않습니다.
+SQL 문법은 새로 만들지 않았습니다. 기존처럼 `SELECT ... WHERE column op value` 형태를 사용하고, executor가 조건을 보고 선형 탐색과 B+ 트리 조회 중 하나를 선택합니다.
 
 ---
 
-## 4분 발표 대본
+## 현재 데이터
 
-안녕하세요. 7조 발표 시작하겠습니다.
+현재 저장소에는 1,000,000건의 플레이어 데이터가 들어 있는 CSV가 포함되어 있습니다.
 
-저번 주에 구현한 SQL 처리기에서는 `SELECT ... WHERE ...` 조건이 들어오면 테이블을 처음부터 끝까지 확인하는 **선형 탐색 방식**으로 처리했습니다.
+```text
+data/players.csv
+data/players.meta
+```
 
-이 방식은 데이터가 적을 때는 괜찮지만, 100만 건처럼 데이터가 커지면 조회 시간이 크게 늘어납니다.
+`players.csv` 스키마:
 
-그래서 저희는 대용량 조회 성능을 개선하기 위해 **B+트리 인덱스**를 학습하고 구현했습니다.
+```csv
+id,nickname,game_win_count,game_loss_count,total_game_count
+```
 
-특히 과제 요구사항에서 `id`를 B+트리 인덱스로 두라고 한 이유에 대해서 공부해봤습니다.
+컬럼 의미:
 
-기존처럼 `WHERE id = ?`를 선형 탐색으로 처리하면 최악의 경우 **O(n)** 이 걸리지만, B+트리를 사용하면 트리를 따라 내려가며 key를 찾기 때문에 **O(log n)** 수준으로 줄일 수 있기 때문입니다.
+| 컬럼 | 의미 |
+| --- | --- |
+| `id` | 자동 증가 정수 PK |
+| `nickname` | 플레이어 닉네임 |
+| `game_win_count` | 승리 횟수 |
+| `game_loss_count` | 패배 횟수 |
+| `total_game_count` | 승리 + 패배 |
 
-이번 구현은 실제 DBMS처럼 디스크에 저장되는 영구 인덱스가 아니라 **메모리 기반 인덱스**입니다.
-
-즉, `SELECT`가 들어오면 `players.csv`를 메모리에 로드하고, 그 데이터를 기준으로 `id`와 `game_win_count`에 대한 B+트리를 구성합니다.
-
-이때 B+트리에는 파일 offset이 아니라 **row_index**를 저장했습니다.
-
-처음에는 파일의 byte offset을 저장하는 방식도 생각할 수 있지만, 그렇게 하면 B+트리로 위치를 찾은 뒤에도 다시 CSV 파일을 열고 해당 위치로 이동해서 row를 읽어야 합니다.
-
-그래서 현재 구현에서는 CSV를 한 번 메모리에 올린 뒤, B+트리 value에 몇 번째 row인지 나타내는 `row_index`를 저장했습니다.
-
-이렇게 하면 key를 찾은 뒤 파일을 다시 읽는 것이 아니라, 메모리에 올라와 있는 `table->rows[row_index]`에 바로 접근할 수 있습니다.
-
-그리고 저희 조는 `id` 외에도 `game_win_count`에 대한 B+트리 인덱스를 만들었습니다.
-
-그 이유는 고유값 조회뿐 아니라 **중복 key 처리**도 직접 다뤄보고 싶었기 때문입니다.
-
-`id`는 고유값이라서 하나의 key가 하나의 row를 가리키면 됩니다.
-
-반면 `game_win_count`는 같은 승리 횟수를 가진 플레이어가 여러 명 있을 수 있습니다.
-
-그래서 `game_win_count` 인덱스에서는 하나의 key에 여러 `row_index`를 연결 리스트 형태로 저장했습니다.
-
-이제 데모를 진행하겠습니다.
-
-1,000,000건의 데이터를 실제 SQL INSERT 문으로 하나씩 넣는 과정은 시간이 오래 걸리기 때문에, 데모 시간 안에서는 보여드리기 어렵다고 판단했습니다.
-
-그래서 이번 데모에서는 미리 생성해둔 `players.csv` 파일을 사용하겠습니다.
-
-먼저 `WHERE id = 500000` 조건으로 선형 탐색과 B+트리 방식을 비교해보겠습니다.
-
-[데모 1: id 조회 비교]
-
-`id`는 고유값이기 때문에 B+트리 인덱스의 효과가 가장 잘 드러납니다.
-
-선형 탐색은 앞에서부터 row를 하나씩 확인해야 하지만, B+트리는 key를 기준으로 leaf node까지 내려가서 원하는 row를 찾습니다.
-
-다음으로 `WHERE game_win_count > 120` 조건을 보겠습니다.
-
-[데모 2: game_win_count 범위 조회 비교]
-
-이 경우에는 조건에 맞는 row가 많기 때문에, 성능이 비슷하게 나오거나 오히려 B+트리가 느릴 수도 있습니다.
-
-여기서 확인한 핵심은 **B+트리가 항상 무조건 유리한 것은 아니라는 점**입니다.
-
-`WHERE id = ?`처럼 결과가 거의 한 건인 단건 조회에서는 B+트리가 매우 유리했습니다.
-
-하지만 `game_win_count`처럼 중복값이 많고 조건에 맞는 row가 많아지면, 결국 읽어와야 하는 데이터 자체가 많아져서 성능 차이가 줄어들 수 있었습니다.
-
-즉 B+트리는 조회 조건에 따라 큰 이점을 줄 수 있지만, 모든 상황에서 무조건 유리한 것은 아니라는 점을 확인할 수 있었습니다.
-
-이상으로 발표 마치겠습니다. 감사합니다.
+`players.meta`에는 다음 INSERT에서 사용할 id가 저장됩니다. 현재 데이터가 1,000,000건이므로 값은 `1000001`입니다.
 
 ---
 
-## 데모 준비
+## 전체 실행 흐름
 
-Docker 이미지를 먼저 빌드합니다.
+```text
+SQL 입력
+-> tokenizer
+-> parser
+-> executor
+-> storage / index
+-> 결과 출력
+```
+
+주요 파일:
+
+| 파일 | 역할 |
+| --- | --- |
+| `src/main.c` | REPL/파일 모드, 실행 옵션 처리 |
+| `src/parser.h` | SQL 구조체 정의 |
+| `src/executor.c` | 실행 계획 선택, SELECT/INSERT/DELETE 실행 |
+| `src/storage.c` | CSV 읽기/쓰기, players INSERT, meta id 관리 |
+| `src/bptree.c` | B+ 트리 코어 |
+| `src/index.c` | `players` 전용 B+ 트리 index manager |
+
+---
+
+## B+ 트리 설계
+
+B+ 트리 코어는 `src/bptree.h`, `src/bptree.c`에 있습니다.
+
+핵심 구조:
+
+```c
+BPTree
+BPTreeNode
+```
+
+구현 특징:
+
+- 내부 노드는 탐색용 key와 child pointer를 저장합니다.
+- leaf 노드는 실제 value pointer를 저장합니다.
+- leaf 노드는 `next` 포인터로 연결됩니다.
+- node가 가득 차면 split합니다.
+- 기본 `BPTREE_ORDER`는 64입니다.
+
+현재 `BPTreeNode`에는 `prev` 포인터가 없고 `next` 포인터만 있습니다. 따라서 leaf scan은 왼쪽에서 오른쪽 방향으로 수행합니다.
+
+---
+
+## Index Manager 설계
+
+`src/index.h`, `src/index.c`는 B+ 트리를 직접 사용하는 index manager입니다.
+
+```c
+typedef struct {
+    BPTree *id_tree;
+    BPTree *win_tree;
+} PlayerIndexSet;
+```
+
+현재 인덱스 value는 CSV 파일 offset이 아니라 **row_index**입니다.
+
+| 인덱스 | key | value | 설명 |
+| --- | --- | --- | --- |
+| `id_tree` | `id` | `RowRef*` | `id -> row_index` |
+| `win_tree` | `game_win_count` | `OffsetList*` | `game_win_count -> row_index list` |
+
+중요한 변경점:
+
+```text
+이전 방식: B+ 트리 -> CSV offset -> 파일에서 row 다시 읽기
+현재 방식: B+ 트리 -> row_index -> table->rows[row_index] 바로 사용
+```
+
+이렇게 바꾼 이유는 범위 조회나 중복 key 조회에서 파일을 여러 번 다시 읽는 비용을 줄이기 위해서입니다.
+
+참고로 `OffsetNode`, `OffsetList`라는 이름은 남아 있지만, 현재 내부에 저장되는 값은 파일 offset이 아니라 `int row_index`입니다.
+
+---
+
+## 실행 계획
+
+`src/executor.c`의 `executor_choose_select_plan()`이 SELECT 실행 계획을 결정합니다.
+
+| 조건 | 기본 실행 계획 |
+| --- | --- |
+| `WHERE id = ?` | ID B+트리 조회 |
+| `WHERE game_win_count = ?` | 승리 횟수 B+트리 조회 |
+| `WHERE game_win_count > ?` 등 범위 조건 | 승리 횟수 B+트리 조회 |
+| `WHERE nickname = ?` | 선형 탐색 |
+| `WHERE game_loss_count = ?` | 선형 탐색 |
+| `WHERE total_game_count = ?` | 선형 탐색 |
+| WHERE 없음 | 전체 조회 |
+
+실행 결과에는 실행 계획이 함께 출력됩니다.
+
+예시:
+
+```text
+[실행 계획] ID B+트리 조회
+       B+ 트리 사용: id -> row index
+       결과 행=1, 검사 행=1, 소요 시간=0.036 ms
+```
+
+---
+
+## 직접 SQL 입력
+
+Docker 기준:
 
 ```powershell
 docker build -t mini-sql-btree:test .
+docker run -it --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor"
 ```
 
-데모는 `--summary-only` 옵션을 사용합니다. 이 옵션은 결과 표를 생략하고 실행 계획, 결과 행 수, 검사 행 수, 소요 시간만 보여줘서 발표 화면이 깔끔해집니다.
+REPL이 뜨면 SQL을 직접 입력합니다.
+
+```sql
+SELECT * FROM players WHERE id = 500000;
+SELECT * FROM players WHERE game_win_count = 150;
+SELECT * FROM players WHERE nickname = 'player_500000';
+```
+
+종료:
+
+```text
+exit
+```
 
 ---
 
-## 데모 1. id 조회 비교
+## 실행 예시
 
-### 1-1. 선형 탐색
+`--summary-only` 옵션을 사용하면 결과 표를 생략하고 실행 계획, 결과 행 수, 검사 행 수, 소요 시간만 볼 수 있습니다.
+
+### 1. id 선형 탐색
 
 ```powershell
 docker run -it --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-linear"
 ```
 
-REPL이 뜨면 입력합니다.
+입력:
 
 ```sql
 SELECT * FROM players WHERE id = 500000;
 ```
 
-발표 멘트:
+확인 포인트:
 
-```text
-지금은 force-linear 옵션을 줬기 때문에 id 조건이어도 B+트리를 쓰지 않고 선형 탐색으로 조회합니다.
-선형 탐색은 원하는 id를 찾기 위해 row를 앞에서부터 순서대로 확인합니다.
-```
+- 실행 계획이 선형 탐색으로 표시됩니다.
+- `id`를 찾기 위해 row를 순서대로 확인합니다.
 
-### 1-2. B+트리 id 인덱스
+### 2. id B+트리 인덱스
 
 ```powershell
 docker run -it --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-id-index"
 ```
 
-REPL이 뜨면 같은 SQL을 입력합니다.
+입력:
 
 ```sql
 SELECT * FROM players WHERE id = 500000;
 ```
 
-발표 멘트:
+확인 포인트:
 
-```text
-이번에는 force-id-index 옵션으로 id B+트리 인덱스를 사용했습니다.
-같은 SQL이지만 실행 계획이 ID B+트리 조회로 바뀐 것을 볼 수 있습니다.
-```
+- 실행 계획이 ID B+트리 조회로 표시됩니다.
+- `id`는 고유값이므로 B+트리 효과가 가장 잘 보입니다.
+- 첫 조회는 CSV 로드와 B+트리 생성 시간이 포함될 수 있습니다.
+- 같은 프로그램 안에서 한 번 더 조회하면 캐시된 B+트리를 재사용합니다.
 
-참고: 첫 B+트리 조회는 CSV 로드와 인덱스 생성 시간이 포함되어 느릴 수 있습니다. 같은 프로그램 안에서 같은 SQL을 한 번 더 실행하면 이미 만들어진 인덱스를 재사용해서 더 빠르게 나옵니다.
-
----
-
-## 데모 2. game_win_count 범위 조회 비교
-
-### 2-1. 선형 탐색
+### 3. game_win_count 선형 탐색
 
 ```powershell
 docker run -it --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-linear"
 ```
 
-REPL이 뜨면 입력합니다.
+입력:
 
 ```sql
 SELECT * FROM players WHERE game_win_count > 120;
 ```
 
-발표 멘트:
+확인 포인트:
 
-```text
-이번 조건은 game_win_count가 120보다 큰 row를 모두 찾는 범위 조회입니다.
-조건에 해당하는 row가 많으면 선형 탐색도 단순히 한 번 훑으면서 결과를 모으기 때문에 생각보다 나쁘지 않을 수 있습니다.
-```
+- 조건에 맞는 row가 많으면 선형 탐색도 한 번 훑으면서 결과를 모으기 때문에 단순합니다.
 
-### 2-2. B+트리 win_count 인덱스
+### 4. game_win_count B+트리 인덱스
 
 ```powershell
 docker run -it --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-win-index"
 ```
 
-REPL이 뜨면 같은 SQL을 입력합니다.
+입력:
 
 ```sql
 SELECT * FROM players WHERE game_win_count > 120;
 ```
 
-발표 멘트:
+확인 포인트:
 
-```text
-이번에는 game_win_count B+트리 인덱스를 사용했습니다.
-다만 이 조건은 결과 row가 많기 때문에, B+트리로 시작점을 찾더라도 결국 많은 row를 가져와야 합니다.
-그래서 B+트리가 항상 압도적으로 빠르지는 않다는 점을 확인할 수 있습니다.
-```
+- 실행 계획이 승리 횟수 B+트리 조회로 표시됩니다.
+- `game_win_count`는 중복 key가 있기 때문에 하나의 key가 여러 row index를 가질 수 있습니다.
+- 조건에 맞는 row가 많으면 B+트리도 결국 많은 결과를 가져와야 하므로 항상 빠르지는 않습니다.
 
 ---
 
-## 빠른 파일 실행 데모
+## 선형 탐색과 B+ 트리 직접 비교
 
-대화형 입력이 부담스러우면 이미 만들어둔 SQL 파일로 `id` 조회를 바로 비교할 수 있습니다.
+같은 SQL을 실행하되, 프로그램 실행 옵션으로 경로를 강제할 수 있습니다.
 
-선형 탐색:
+| 옵션 | 설명 |
+| --- | --- |
+| `--force-linear` | SELECT를 선형 탐색으로 강제 |
+| `--force-id-index` | `id` 조건을 ID B+트리로 강제 |
+| `--force-win-index` | `game_win_count` 조건을 승리 횟수 B+트리로 강제 |
+| `--summary-only` | SELECT 결과 표 생략, 요약만 출력 |
+| `--silent` | INSERT/SELECT/DELETE 출력 제거 |
+
+파일로 한 번에 비교하려면 아래 SQL 파일을 사용할 수 있습니다.
 
 ```powershell
 docker run --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-linear bench/select_id_500000_twice.sql"
 ```
-
-B+트리:
 
 ```powershell
 docker run --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-id-index bench/select_id_500000_twice.sql"
@@ -203,63 +271,180 @@ docker run --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-
 
 ---
 
-## 구현 설명용 키워드
+## 자주 쓰는 조회문
 
-발표 중 질문이 나오면 아래 표현을 사용하면 됩니다.
+ID 단건 조회:
 
-| 질문 | 답변 |
-| --- | --- |
-| B+트리는 어디에 구현했나요? | `src/bptree.c`, `src/bptree.h`에 구현했습니다. |
-| 어떤 컬럼에 인덱스를 만들었나요? | `id`, `game_win_count` 두 컬럼입니다. |
-| 왜 `game_win_count`도 했나요? | 중복 key를 가진 secondary index를 다뤄보기 위해서입니다. |
-| offset을 저장하나요? | 현재 B+트리 value에는 파일 offset이 아니라 `row_index`를 저장합니다. |
-| 왜 row_index로 바꿨나요? | 인덱스 조회 후 CSV 파일을 다시 읽지 않고 `table->rows[row_index]`로 바로 접근하기 위해서입니다. |
-| B+트리는 디스크에 남나요? | 아닙니다. 현재 구현은 프로그램 실행 중 메모리에 만드는 인덱스입니다. |
-| 첫 조회가 왜 느린가요? | CSV 로드와 B+트리 생성 시간이 포함되기 때문입니다. |
-| B+트리가 항상 빠른가요? | 아닙니다. 조건에 맞는 row가 많으면 결국 많은 데이터를 읽어야 해서 선형 탐색과 차이가 줄거나 느릴 수 있습니다. |
+```sql
+SELECT * FROM players WHERE id = 500000;
+```
+
+승리 횟수 조회, 결과 적음:
+
+```sql
+SELECT * FROM players WHERE game_win_count = 150;
+```
+
+승리 횟수 조회, 결과 많음:
+
+```sql
+SELECT * FROM players WHERE game_win_count > 120;
+```
+
+선형 탐색 비교용:
+
+```sql
+SELECT * FROM players WHERE nickname = 'player_500000';
+```
 
 ---
 
-## 코드에서 볼 부분
+## 첫 조회가 느린 이유
 
-발표 후 코드 질문이 나오면 아래 파일을 보면 됩니다.
+현재 B+ 트리는 디스크에 저장하지 않고 메모리에만 생성합니다.
 
-| 파일 | 역할 |
-| --- | --- |
-| `src/bptree.h` | B+트리 node 구조체 정의 |
-| `src/bptree.c` | search, insert, split 로직 |
-| `src/index.h` | `RowRef`, `OffsetNode`, `OffsetList`, `PlayerIndexSet` 정의 |
-| `src/index.c` | `id`, `game_win_count` 인덱스 생성 및 조회 |
-| `src/executor.c` | SQL 조건에 따라 선형 탐색/B+트리 선택 |
-| `src/storage.c` | CSV 로드, players INSERT, meta id 관리 |
+첫 B+ 트리 조회:
+
+```text
+CSV 100만 건 로드
+-> id_tree / win_tree 생성
+-> B+ 트리 조회
+```
+
+두 번째 B+ 트리 조회:
+
+```text
+이미 만들어진 B+ 트리 캐시 재사용
+-> 바로 조회
+```
+
+따라서 첫 조회는 느리고, 같은 프로그램 실행 중 두 번째 조회부터 빨라집니다.
 
 ---
 
-## 조심해서 말할 부분
+## INSERT와 Auto ID
 
-아래 표현은 정확히 구분해서 말하는 것이 좋습니다.
+`players` 테이블 INSERT는 `src/storage.c`의 `storage_insert_players()`에서 처리합니다.
 
-잘못 말하기 쉬운 표현:
+입력 SQL:
 
-```text
-INSERT할 때 B+트리에 바로 등록합니다.
+```sql
+INSERT INTO players (nickname, game_win_count, game_loss_count)
+VALUES ('player_new', 20, 10);
 ```
 
-현재 구현 기준으로 더 정확한 표현:
+저장되는 값:
 
 ```text
-현재 구현은 메모리 기반 인덱스라서 SELECT 시점에 CSV 데이터를 기준으로 B+트리를 구성합니다.
-INSERT나 DELETE 후에는 캐시를 무효화하고 다음 조회 때 다시 빌드합니다.
+id: players.meta에서 자동 부여
+nickname: 입력값
+game_win_count: 입력값
+game_loss_count: 입력값
+total_game_count: game_win_count + game_loss_count
 ```
 
-잘못 말하기 쉬운 표현:
+대량 SQL INSERT 파일을 실행할 때는 `--silent`를 사용합니다.
+
+```bash
+./sql_processor --silent bench/insert_1m_players.sql
+```
+
+참고: `bench/insert_1m_players.sql`은 100MB가 넘어서 Git에는 올리지 않았습니다. 대신 실제 데이터 파일인 `data/players.csv`를 저장소에 포함했습니다.
+
+---
+
+## Benchmark
+
+평균 성능 비교는 `bench/benchmark.c`로 실행합니다.
+
+기본 실행:
+
+```powershell
+docker run --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make benchmark BENCH_ROWS=1000000 BENCH_QUERIES=1000"
+```
+
+빠른 확인:
+
+```powershell
+docker run --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make benchmark BENCH_ROWS=100000 BENCH_QUERIES=100"
+```
+
+Benchmark가 비교하는 항목:
+
+- `WHERE id = ?` 선형 탐색 vs ID B+트리
+- `WHERE game_win_count = ?` 선형 탐색 vs 승리 횟수 B+트리
+- `WHERE nickname = ?` 일반 선형 탐색 참고값
+
+---
+
+## 테스트
+
+전체 테스트:
+
+```powershell
+docker run --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make tests"
+```
+
+현재 결과:
 
 ```text
-B+트리 value에 offset을 저장합니다.
+Results: 14 passed, 0 failed
 ```
 
-현재 구현 기준으로 더 정확한 표현:
+테스트 파일:
+
+| 파일 | 검증 내용 |
+| --- | --- |
+| `tests/test_bptree.c` | B+ 트리 insert/search/split/duplicate |
+| `tests/test_index.c` | `id_tree`, `win_tree`, row_index 저장 |
+| `tests/test_executor.c` | 실행 계획 분기, 캐시 무효화 |
+| `tests/test_cases/players_bptree.sql` | SQL 통합 흐름 |
+
+---
+
+## 이번 과제에서 공부할 핵심 함수
+
+시간이 적으면 아래 순서로 보면 됩니다.
+
+1. `src/bptree.h`
+2. `bptree_search()`
+3. `bptree_insert()`
+4. `src/index.h`
+5. `index_build_player_indexes()`
+6. `index_collect_win_count_row_indexes()`
+7. `executor_choose_select_plan()`
+8. `executor_collect_id_indexed_rows()`
+9. `executor_collect_win_indexed_rows()`
+10. `storage_insert_players()`
+
+핵심 요약:
 
 ```text
-처음에는 offset 방식도 고려할 수 있지만, 현재 구현에서는 파일 offset 대신 row_index를 저장합니다.
+players.csv를 TableData로 메모리에 로드한다.
+id와 game_win_count에 대해 B+ 트리를 만든다.
+B+ 트리 leaf에는 파일 offset이 아니라 row_index를 저장한다.
+조회 시 table->rows[row_index]를 바로 사용한다.
 ```
+
+---
+
+## 구현 범위와 단순화한 부분
+
+구현한 것:
+
+- 메모리 기반 B+ 트리
+- `id` B+ 트리 인덱스
+- `game_win_count` B+ 트리 인덱스
+- `game_win_count` 중복 key를 위한 row index list
+- `game_win_count` 범위 조건 leaf scan
+- `players.meta` 기반 auto id
+- 선형 탐색/B+트리 강제 비교 옵션
+- benchmark 실행 파일
+
+단순화한 것:
+
+- B+ 트리는 디스크에 저장하지 않습니다.
+- B+ 트리 delete/rebalance는 구현하지 않았습니다.
+- DELETE 후에는 캐시를 무효화하고 다음 조회 때 다시 빌드합니다.
+- 인덱스 대상은 `id`, `game_win_count` 두 컬럼으로 고정했습니다.
+- `nickname`, `game_loss_count`, `total_game_count`는 선형 탐색입니다.
