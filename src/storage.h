@@ -67,4 +67,41 @@ void storage_free_rows(char ***rows, int row_count, int col_count);
  */
 void storage_free_table(TableData *table);
 
+/*
+ * INSERT 결과 구조체.
+ * executor가 INSERT 성공 직후 캐시된 인덱스에 즉시 반영할 수 있도록
+ * 할당된 id, 승리/패배/총 횟수, 파일 오프셋을 함께 반환한다.
+ */
+typedef struct {
+    long long assigned_id;
+    int game_win_count;
+    int game_loss_count;
+    int total_game_count;
+    long file_offset;
+    int id_was_auto_generated;
+} StorageInsertResult;
+
+/*
+ * INSERT 실행 후 결과 정보를 함께 반환하는 확장 함수.
+ * 성공 시 SUCCESS, 실패 시 FAILURE를 반환한다.
+ * result가 NULL이면 기존 storage_insert()와 동일하게 동작한다.
+ */
+int storage_insert_with_result(const char *table_name, const InsertStatement *stmt,
+                               StorageInsertResult *result);
+
+/*
+ * meta 파일에서 next_id를 읽는다.
+ * meta 파일이 없으면 CSV를 한 번 스캔하여 복구한다.
+ *
+ * 왜 meta에서 읽는가?
+ *   1,000,000건 INSERT 시 매번 CSV 전체를 스캔하면 O(n^2)이 된다.
+ *   meta 파일을 두면 O(1)에 next_id를 얻을 수 있다.
+ */
+long long storage_get_next_id_from_meta(const char *table_name);
+
+/*
+ * meta 파일에 next_id를 저장한다.
+ */
+int storage_save_next_id_to_meta(const char *table_name, long long next_id);
+
 #endif

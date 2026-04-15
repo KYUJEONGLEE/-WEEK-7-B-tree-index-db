@@ -1393,3 +1393,304 @@ void storage_free_table(TableData *table) {
     table->row_count = 0;
     table->col_count = 0;
 }
+
+/* ─────────────────────────────────────────────────────────
+ * Meta 기반 auto-increment id 관리
+ * ─────────────────────────────────────────────────────────
+ * 왜 meta 파일에서 next_id를 읽는가?
+ *   기존 방식은 INSERT마다 CSV 전체를 스캔하여 최대 id를 찾았다.
+ *   1,000,000건 테이블에서 이 방식은 O(n)이 매 INSERT마다 발생한다.
+ *   meta 파일(data/<table>.meta)에 next_id를 저장하면 O(1)에 읽을 수 있다.
+ *
+ * meta가 없을 때만 full scan 하는 이유:
+ *   기존 테이블에 meta 파일이 없는 경우(마이그레이션)에 대비하여
+ *   한 번만 CSV를 스캔하여 next_id를 복구하고, 이후부터는 meta만 사용한다.
+ * ───────────────────────────────────────────────────────── */
+
+static int storage_build_meta_path(const char *table_name, char *path, size_t path_size) {
+    if (snprintf(path, path_size, "data/%s.meta", table_name) < 0) {
+        return FAILURE;
+    }
+    return SUCCESS;
+}
+
+/*
+ * meta 파일에서 next_id를 읽는다.
+ * meta 파일이 없으면 CSV 전체를 한 번 스캔하여 next_id를 복구하고 meta에 저장한다.
+ */
+long long storage_get_next_id_from_meta(const char *table_name) {
+    char meta_path[MAX_PATH_LEN];
+    char csv_path[MAX_PATH_LEN];
+    FILE *fp;
+    long long next_id;
+    char line[MAX_CSV_LINE_LENGTH];
+    char existing_columns[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
+    int existing_count;
+    int id_index;
+    char **parsed_fields;
+    int parsed_count;
+    long long current_id;
+
+    if (table_name == NULL) {
+        return 1;
+    }
+
+    if (storage_build_meta_path(table_name, meta_path, sizeof(meta_path)) != SUCCESS) {
+        return 1;
+    }
+
+    /* meta 파일이 있으면 거기서 읽기 */
+    fp = fopen(meta_path, "r");
+    if (fp != NULL) {
+        if (fscanf(fp, "%lld", &next_id) == 1) {
+            fclose(fp);
+            return next_id;
+        }
+        fclose(fp);
+    }
+
+    /* meta가 없으면 CSV 스캔으로 복구 */
+    if (storage_build_path(table_name, csv_path, sizeof(csv_path)) != SUCCESS) {
+        return 1;
+    }
+
+    fp = fopen(csv_path, "r");
+    if (fp == NULL) {
+        return 1;
+    }
+
+    if (storage_read_header(fp, existing_columns, &existing_count) != SUCCESS) {
+        fclose(fp);
+        return 1;
+    }
+
+    id_index = storage_find_column_index(existing_columns, existing_count, "id");
+    if (id_index == FAILURE) {
+        fclose(fp);
+        return 1;
+    }
+
+    next_id = 1;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        if (line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+        if (storage_parse_csv_line(line, &parsed_fields, &parsed_count) != SUCCESS) {
+            continue;
+        }
+        if (parsed_count > id_index && utils_is_integer(parsed_fields[id_index])) {
+            current_id = utils_parse_integer(parsed_fields[id_index]);
+            if (current_id >= next_id) {
+                next_id = current_id + 1;
+            }
+        }
+        storage_free_field_list(parsed_fields, parsed_count);
+    }
+    fclose(fp);
+
+    /* 복구한 next_id를 meta에 저장 */
+    storage_save_next_id_to_meta(table_name, next_id);
+    return next_id;
+}
+
+/*
+ * meta 파일에 next_id를 저장한다.
+ */
+int storage_save_next_id_to_meta(const char *table_name, long long next_id) {
+    char meta_path[MAX_PATH_LEN];
+    FILE *fp;
+
+    if (table_name == NULL) {
+        return FAILURE;
+    }
+
+    if (storage_ensure_data_dir() != SUCCESS) {
+        return FAILURE;
+    }
+
+    if (storage_build_meta_path(table_name, meta_path, sizeof(meta_path)) != SUCCESS) {
+        return FAILURE;
+    }
+
+    fp = fopen(meta_path, "w");
+    if (fp == NULL) {
+        return FAILURE;
+    }
+
+    fprintf(fp, "%lld\n", next_id);
+    fclose(fp);
+    return SUCCESS;
+}
+
+/*
+ * 함수명: storage_insert_with_result
+ * ─────────────────────────────────────────────────────────
+ * 기능: INSERT 실행 후 결과 정보(할당된 id, 승리 횟수 등)를 함께 반환한다.
+ *
+ * 핵심 흐름:
+ *   1. meta 파일에서 next_id를 O(1)로 읽는다
+ *   2. 기존 storage_insert() 로직 수행
+ *   3. 결과를 StorageInsertResult에 담아 반환
+ *   4. next_id를 meta에 저장
+ *
+ * 개념:
+ *   executor가 INSERT 성공 직후 캐시된 인덱스에 즉시 반영하려면
+ *   할당된 id, game_win_count, offset 정보가 필요하다.
+ *   total_game_count는 저장 전에 wins + losses로 계산하여 데이터 일관성을 보장한다.
+ * ───────────────────────────────────────────────────────── */
+int storage_insert_with_result(const char *table_name, const InsertStatement *stmt,
+                               StorageInsertResult *result) {
+    FILE *fp;
+    char path[MAX_PATH_LEN];
+    char existing_columns[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
+    int existing_count;
+    int i;
+    int match_index;
+    int existing_id_index;
+    int stmt_id_index;
+    const char *ordered_values[MAX_COLUMNS];
+    char auto_id_value[MAX_VALUE_LEN];
+    long file_offset;
+    long long next_id;
+    int win_col_idx;
+    int loss_col_idx;
+    int total_col_idx;
+    char total_buf[MAX_VALUE_LEN];
+
+    if (table_name == NULL || stmt == NULL) {
+        return FAILURE;
+    }
+
+    if (storage_ensure_data_dir() != SUCCESS) {
+        return FAILURE;
+    }
+
+    if (storage_build_path(table_name, path, sizeof(path)) != SUCCESS) {
+        return FAILURE;
+    }
+
+    fp = fopen(path, "a+");
+    if (fp == NULL) {
+        fprintf(stderr, "Error: Failed to open table '%s'.\n", table_name);
+        return FAILURE;
+    }
+
+    if (storage_lock_file(fp, LOCK_EX) != SUCCESS) {
+        fclose(fp);
+        return FAILURE;
+    }
+
+    rewind(fp);
+    if (storage_read_header(fp, existing_columns, &existing_count) != SUCCESS) {
+        /* 빈 파일 → 새 테이블. 기존 storage_insert() 위임 후 result 채움 */
+        flock(fileno(fp), LOCK_UN);
+        fclose(fp);
+        if (storage_insert(table_name, stmt) != SUCCESS) {
+            return FAILURE;
+        }
+        if (result != NULL) {
+            result->assigned_id = 1;
+            result->id_was_auto_generated = 1;
+            result->file_offset = 0; /* 첫 행 오프셋은 정확하지 않지만 rebuild 예정 */
+            result->game_win_count = 0;
+            result->game_loss_count = 0;
+            result->total_game_count = 0;
+            /* 컬럼 값 파싱 */
+            for (i = 0; i < stmt->column_count; i++) {
+                if (strcmp(stmt->columns[i], "game_win_count") == 0) {
+                    result->game_win_count = atoi(stmt->values[i]);
+                } else if (strcmp(stmt->columns[i], "game_loss_count") == 0) {
+                    result->game_loss_count = atoi(stmt->values[i]);
+                }
+            }
+            result->total_game_count = result->game_win_count + result->game_loss_count;
+            storage_save_next_id_to_meta(table_name, 2);
+        }
+        return SUCCESS;
+    }
+
+    existing_id_index = storage_find_column_index(existing_columns, existing_count, "id");
+    stmt_id_index = storage_find_column_index(
+        (const char (*)[MAX_IDENTIFIER_LEN])stmt->columns,
+        stmt->column_count, "id");
+
+    /* meta 기반 auto-id */
+    if (existing_id_index != FAILURE && stmt_id_index == FAILURE) {
+        next_id = storage_get_next_id_from_meta(table_name);
+        snprintf(auto_id_value, sizeof(auto_id_value), "%lld", next_id);
+    }
+
+    /* ordered_values 구성 */
+    for (i = 0; i < existing_count; i++) {
+        if (i == existing_id_index && stmt_id_index == FAILURE) {
+            ordered_values[i] = auto_id_value;
+            continue;
+        }
+        match_index = storage_find_column_index(
+            (const char (*)[MAX_IDENTIFIER_LEN])stmt->columns,
+            stmt->column_count, existing_columns[i]);
+        if (match_index == FAILURE) {
+            fprintf(stderr, "Error: Column '%s' doesn't exist in INSERT.\n",
+                    existing_columns[i]);
+            flock(fileno(fp), LOCK_UN);
+            fclose(fp);
+            return FAILURE;
+        }
+        ordered_values[i] = stmt->values[match_index];
+    }
+
+    /* total_game_count 자동 계산: wins + losses로 재계산하여 데이터 일관성 보장 */
+    win_col_idx = storage_find_column_index(existing_columns, existing_count, "game_win_count");
+    loss_col_idx = storage_find_column_index(existing_columns, existing_count, "game_loss_count");
+    total_col_idx = storage_find_column_index(existing_columns, existing_count, "total_game_count");
+    if (win_col_idx >= 0 && loss_col_idx >= 0 && total_col_idx >= 0) {
+        int wins = atoi(ordered_values[win_col_idx]);
+        int losses = atoi(ordered_values[loss_col_idx]);
+        snprintf(total_buf, sizeof(total_buf), "%d", wins + losses);
+        ordered_values[total_col_idx] = total_buf;
+    }
+
+    /* append 직전 offset을 잡는다:
+     * fseek(SEEK_END) 후 ftell()이 새 row의 시작 offset이 된다 */
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        flock(fileno(fp), LOCK_UN);
+        fclose(fp);
+        return FAILURE;
+    }
+    file_offset = ftell(fp);
+
+    if (storage_write_csv_row(fp, ordered_values, existing_count) != SUCCESS) {
+        flock(fileno(fp), LOCK_UN);
+        fclose(fp);
+        return FAILURE;
+    }
+
+    fflush(fp);
+    flock(fileno(fp), LOCK_UN);
+    fclose(fp);
+
+    /* meta 갱신 */
+    if (existing_id_index != FAILURE && stmt_id_index == FAILURE) {
+        storage_save_next_id_to_meta(table_name, next_id + 1);
+    }
+
+    /* 결과 채우기 */
+    if (result != NULL) {
+        if (existing_id_index != FAILURE && stmt_id_index == FAILURE) {
+            result->assigned_id = next_id;
+            result->id_was_auto_generated = 1;
+        } else if (existing_id_index != FAILURE) {
+            result->assigned_id = atoll(ordered_values[existing_id_index]);
+            result->id_was_auto_generated = 0;
+        } else {
+            result->assigned_id = 0;
+            result->id_was_auto_generated = 0;
+        }
+        result->file_offset = file_offset;
+        result->game_win_count = (win_col_idx >= 0) ? atoi(ordered_values[win_col_idx]) : 0;
+        result->game_loss_count = (loss_col_idx >= 0) ? atoi(ordered_values[loss_col_idx]) : 0;
+        result->total_game_count = result->game_win_count + result->game_loss_count;
+    }
+
+    return SUCCESS;
+}

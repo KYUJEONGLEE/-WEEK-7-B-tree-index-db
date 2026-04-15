@@ -1,0 +1,11 @@
+INSERT INTO players (nickname, game_win_count, game_loss_count) VALUES ('alpha', 10, 5);
+INSERT INTO players (nickname, game_win_count, game_loss_count) VALUES ('bravo', 20, 3);
+INSERT INTO players (nickname, game_win_count, game_loss_count) VALUES ('charlie', 10, 8);
+INSERT INTO players (nickname, game_win_count, game_loss_count) VALUES ('delta', 30, 2);
+SELECT * FROM players WHERE id = 1;
+SELECT * FROM players WHERE id = 3;
+SELECT * FROM players WHERE game_win_count = 10;
+SELECT * FROM players WHERE nickname = 'bravo';
+DELETE FROM players WHERE id = 2;
+SELECT * FROM players WHERE id = 2;
+SELECT * FROM players;

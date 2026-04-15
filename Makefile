@@ -4,6 +4,7 @@ SRC_DIR = src
 TEST_DIR = tests
 BUILD_DIR = build
 TARGET = sql_processor
+BENCHMARK_BIN = benchmark_runner
 TEST_BIN_DIR = $(BUILD_DIR)/tests
 
 MAIN_SRCS = $(filter-out $(SRC_DIR)/main.c,$(wildcard $(SRC_DIR)/*.c))
@@ -33,7 +34,14 @@ $(TEST_BIN_DIR):
 tests: $(TARGET) $(TEST_BINS)
 	bash $(TEST_DIR)/run_tests.sh
 
-clean:
-	rm -rf $(BUILD_DIR) $(TARGET) data/*.csv
+# 벤치마크 전용 바이너리
+$(BENCHMARK_BIN): $(TEST_DIR)/benchmark.c $(CORE_OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -O2 -o $@ $< $(CORE_OBJS)
 
-.PHONY: all tests clean
+benchmark: $(BENCHMARK_BIN)
+	./$(BENCHMARK_BIN)
+
+clean:
+	rm -rf $(BUILD_DIR) $(TARGET) $(BENCHMARK_BIN) data/*.csv data/*.meta
+
+.PHONY: all tests clean benchmark
