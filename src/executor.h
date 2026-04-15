@@ -39,6 +39,19 @@ int executor_execute_select_with_mode(const SelectStatement *stmt, ExecMode mode
                                       int silent, ExecStats *stats);
 
 /*
+ * 같은 SELECT를 선형 탐색과 인덱스 선택 모드로 각각 실행해 비교 출력한다.
+ * 데모에서 SQL을 한 번만 입력하고 두 실행 계획의 시간을 함께 볼 때 사용한다.
+ */
+int executor_execute_select_compare(const SelectStatement *stmt,
+                                    ExecMode index_mode, int silent);
+
+/*
+ * 지정한 테이블을 메모리에 미리 로드하고 가능한 B+ 트리 인덱스를 빌드한다.
+ * 첫 SELECT에 로딩/인덱스 생성 시간이 섞이지 않게 만드는 데 사용한다.
+ */
+int executor_preload_indexes(const char *table_name, int silent);
+
+/*
  * 일반 executor 출력 여부를 설정한다.
  * 대량 SQL 파일 입력에서는 INSERT 성공 메시지 100만 줄이 병목이 될 수 있어 끌 수 있다.
  */

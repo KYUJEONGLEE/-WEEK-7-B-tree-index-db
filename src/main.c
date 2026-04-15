@@ -8,6 +8,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static int main_compare_index_mode = 0;
+static int main_compare_silent = 0;
+static ExecMode main_compare_exec_mode = EXEC_MODE_NORMAL;
 
 /*
  * 문자열에서 연속된 공백을 건너뛰고 다음 유효 위치를 찾는다.
@@ -83,6 +88,13 @@ static int main_process_sql_statement(const char *sql)
     if (status != SUCCESS || is_empty)
     {
         return status;
+    }
+
+    if (main_compare_index_mode && statement.type == SQL_SELECT)
+    {
+        return executor_execute_select_compare(&statement.select,
+                                               main_compare_exec_mode,
+                                               main_compare_silent);
     }
 
     return executor_execute(&statement);
@@ -168,7 +180,12 @@ static int main_run_bulk_insert_mode(const char *path, int silent)
     int bulk_started;
     int bulk_kind;
     int status;
+    clock_t started_at;
+    double elapsed_seconds;
 
+    (void)silent;
+
+    started_at = clock();
     content = utils_read_file(path);
     if (content == NULL)
     {
@@ -300,12 +317,16 @@ static int main_run_bulk_insert_mode(const char *path, int silent)
                 status = storage_insert_test_records_bulk_finish(&records_bulk);
             }
 
-            if (status == SUCCESS && !silent)
+            if (status == SUCCESS)
             {
-                printf("[성공] %s 테이블에 %ld행을 bulk INSERT했습니다.\n",
+                elapsed_seconds =
+                    (double)(clock() - started_at) / (double)CLOCKS_PER_SEC;
+                printf("[완료] INSERT 데모 완료: %s 테이블에 %ld행을 저장했습니다. "
+                       "소요 시간=%.3f초\n",
                        bulk_kind == 1 ? players_bulk.table_name : records_bulk.table_name,
                        bulk_kind == 1 ? players_bulk.inserted_count :
-                                        records_bulk.inserted_count);
+                                        records_bulk.inserted_count,
+                       elapsed_seconds);
             }
         }
         else
@@ -430,6 +451,7 @@ static int main_run_repl_mode(void)
 
             main_process_sql_statement(statement);
             free(statement);
+            puts("------------------------------------------------------------");
 
             if (main_replace_buffer_with_remainder(&buffer, &buffer_length,
                                                    &buffer_capacity,
@@ -465,6 +487,7 @@ int main(int argc, char *argv[])
     int silent;
     int summary_only;
     int bulk_insert;
+    int compare_index;
     ExecMode mode;
     int i;
 
@@ -472,6 +495,7 @@ int main(int argc, char *argv[])
     silent = 0;
     summary_only = 0;
     bulk_insert = 0;
+    compare_index = 0;
     mode = EXEC_MODE_NORMAL;
 
     for (i = 1; i < argc; i++)
@@ -487,6 +511,10 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "--bulk-insert") == 0)
         {
             bulk_insert = 1;
+        }
+        else if (strcmp(argv[i], "--compare-index") == 0)
+        {
+            compare_index = 1;
         }
         else if (strcmp(argv[i], "--force-linear") == 0)
         {
@@ -507,15 +535,31 @@ int main(int argc, char *argv[])
         else
         {
             fprintf(stderr,
-                    "Usage: %s [--silent] [--summary-only] [--bulk-insert] [--force-linear|--force-id-index|--force-win-index] [sql_file]\n",
+                    "Usage: %s [--silent] [--summary-only] [--bulk-insert] [--compare-index] [--force-linear|--force-id-index|--force-win-index] [sql_file]\n",
                     argv[0]);
             return EXIT_FAILURE;
         }
     }
 
+    if (bulk_insert && compare_index)
+    {
+        fprintf(stderr, "Error: --bulk-insert and --compare-index cannot be used together.\n");
+        return EXIT_FAILURE;
+    }
+
     executor_set_silent(silent);
     executor_set_summary_only(summary_only);
     executor_set_mode(mode);
+    main_compare_index_mode = compare_index;
+    main_compare_silent = silent;
+    main_compare_exec_mode = mode == EXEC_MODE_FORCE_LINEAR ? EXEC_MODE_NORMAL : mode;
+
+    if (compare_index && executor_preload_indexes("players", silent) != SUCCESS)
+    {
+        fprintf(stderr,
+                "Error: Failed to preload players table and B+ tree indexes.\n");
+        return EXIT_FAILURE;
+    }
 
     if (bulk_insert && sql_file == NULL)
     {

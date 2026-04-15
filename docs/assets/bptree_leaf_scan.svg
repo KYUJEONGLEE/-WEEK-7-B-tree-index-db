@@ -28,7 +28,7 @@
   <text class="subtitle" x="48" y="86">exact lookup은 leaf 하나에서 끝나고, 범위 조회는 leaf의 next 포인터를 따라 오른쪽으로 진행한다.</text>
 
   <rect class="internal" x="462" y="126" width="176" height="72" />
-  <text class="label" x="500" y="158">Internal</text>
+  <text class="label" x="519" y="158">Root</text>
   <rect class="key" x="494" y="168" width="46" height="22" />
   <text class="mono" x="508" y="184">100</text>
   <rect class="key" x="560" y="168" width="46" height="22" />

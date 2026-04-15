@@ -130,26 +130,11 @@ static void index_free_leaf_values(BPTree *tree, int free_offset_lists) {
     }
 }
 
-/*
- * 함수명: index_insert_row
- * ----------------------------------------
- * 기능: 플레이어 한 행의 id와 game_win_count를 두 B+ 트리에 반영한다.
- *
- * 핵심 흐름:
- *   1. id tree에는 unique id -> RowRef(row_index)를 삽입한다.
- *   2. win tree에서 같은 game_win_count key를 찾는다.
- *   3. 있으면 기존 OffsetList에 append, 없으면 새 list를 tree에 삽입한다.
- *
- * 개념:
- *   - id는 PK 성격이라 duplicate를 허용하지 않는다.
- *   - game_win_count는 secondary index라 duplicate key를 list value로 해결한다.
- */
-int index_insert_row(PlayerIndexSet *indexes, long long id,
-                     long long game_win_count, int row_index) {
+static int index_insert_id_row(PlayerIndexSet *indexes, long long id,
+                               int row_index) {
     RowRef *ref;
-    OffsetList *win_offsets;
 
-    if (indexes == NULL || indexes->id_tree == NULL || indexes->win_tree == NULL) {
+    if (indexes == NULL || indexes->id_tree == NULL) {
         return FAILURE;
     }
 
@@ -165,6 +150,17 @@ int index_insert_row(PlayerIndexSet *indexes, long long id,
 
     if (bptree_insert(indexes->id_tree, id, ref) != SUCCESS) {
         free(ref);
+        return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
+static int index_insert_win_row(PlayerIndexSet *indexes,
+                                long long game_win_count, int row_index) {
+    OffsetList *win_offsets;
+
+    if (indexes == NULL || indexes->win_tree == NULL) {
         return FAILURE;
     }
 
@@ -190,18 +186,44 @@ int index_insert_row(PlayerIndexSet *indexes, long long id,
 }
 
 /*
- * 함수명: index_build_player_indexes
+ * 함수명: index_insert_row
  * ----------------------------------------
- * 기능: TableData 전체를 읽어 players 전용 id/win_count B+ 트리를 만든다.
+ * 기능: 한 행의 id와 game_win_count를 B+ 트리에 반영한다.
  *
  * 핵심 흐름:
- *   1. id, game_win_count 컬럼 위치를 찾는다.
- *   2. 각 row의 문자열 값을 정수로 검증/변환한다.
- *   3. row index를 value로 두 tree에 삽입한다.
+ *   1. id tree에는 unique id -> RowRef(row_index)를 삽입한다.
+ *   2. win tree가 있으면 game_win_count -> OffsetList(row_index 목록)를 삽입한다.
+ *
+ * 개념:
+ *   - id는 PK 성격이라 duplicate를 허용하지 않는다.
+ *   - game_win_count는 secondary index라 duplicate key를 list value로 해결한다.
+ */
+int index_insert_row(PlayerIndexSet *indexes, long long id,
+                     long long game_win_count, int row_index) {
+    if (index_insert_id_row(indexes, id, row_index) != SUCCESS) {
+        return FAILURE;
+    }
+
+    if (indexes != NULL && indexes->win_tree != NULL) {
+        return index_insert_win_row(indexes, game_win_count, row_index);
+    }
+
+    return SUCCESS;
+}
+
+/*
+ * 함수명: index_build_player_indexes
+ * ----------------------------------------
+ * 기능: TableData 전체를 읽어 id B+ 트리와 선택적 game_win_count B+ 트리를 만든다.
+ *
+ * 핵심 흐름:
+ *   1. id 컬럼 위치를 찾고 id tree를 만든다.
+ *   2. game_win_count 컬럼이 있으면 win tree도 만든다.
+ *   3. row index를 value로 각 tree에 삽입한다.
  *
  * 주의:
- *   - 이 index manager는 players 스키마 전용이다.
- *   - nickname, game_loss_count, total_game_count는 인덱싱하지 않는다.
+ *   - id 컬럼만 있으면 어떤 테이블이든 id B+ 트리 조회가 가능하다.
+ *   - game_win_count는 players처럼 해당 컬럼이 있는 테이블에서만 인덱싱한다.
  */
 int index_build_player_indexes(const TableData *table, PlayerIndexSet *out_indexes) {
     int id_index;
@@ -217,32 +239,41 @@ int index_build_player_indexes(const TableData *table, PlayerIndexSet *out_index
     memset(out_indexes, 0, sizeof(*out_indexes));
     id_index = index_find_column_index(table, "id");
     win_index = index_find_column_index(table, "game_win_count");
-    if (id_index == FAILURE || win_index == FAILURE) {
-        fprintf(stderr,
-                "Error: B+ tree index requires id and game_win_count columns.\n");
+    if (id_index == FAILURE) {
+        fprintf(stderr, "Error: B+ tree index requires an id column.\n");
         return FAILURE;
     }
 
     out_indexes->id_tree = bptree_create(BPTREE_ORDER);
-    out_indexes->win_tree = bptree_create(BPTREE_ORDER);
-    if (out_indexes->id_tree == NULL || out_indexes->win_tree == NULL) {
+    if (win_index != FAILURE) {
+        out_indexes->win_tree = bptree_create(BPTREE_ORDER);
+    }
+    if (out_indexes->id_tree == NULL ||
+        (win_index != FAILURE && out_indexes->win_tree == NULL)) {
         index_free_player_indexes(out_indexes);
         return FAILURE;
     }
 
     for (i = 0; i < table->row_count; i++) {
         if (!utils_is_integer(table->rows[i][id_index]) ||
-            !utils_is_integer(table->rows[i][win_index])) {
+            (win_index != FAILURE && !utils_is_integer(table->rows[i][win_index]))) {
             fprintf(stderr, "Error: Indexed columns must contain integer values.\n");
             index_free_player_indexes(out_indexes);
             return FAILURE;
         }
 
         id = utils_parse_integer(table->rows[i][id_index]);
-        win_count = utils_parse_integer(table->rows[i][win_index]);
-        if (index_insert_row(out_indexes, id, win_count, i) != SUCCESS) {
+        if (index_insert_id_row(out_indexes, id, i) != SUCCESS) {
             index_free_player_indexes(out_indexes);
             return FAILURE;
+        }
+
+        if (win_index != FAILURE) {
+            win_count = utils_parse_integer(table->rows[i][win_index]);
+            if (index_insert_win_row(out_indexes, win_count, i) != SUCCESS) {
+                index_free_player_indexes(out_indexes);
+                return FAILURE;
+            }
         }
     }
 

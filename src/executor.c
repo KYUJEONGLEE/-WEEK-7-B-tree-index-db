@@ -10,6 +10,7 @@
 
 #define EXECUTOR_TABLE_CACHE_LIMIT 8
 #define EXECUTOR_INDEX_CACHE_LIMIT 16
+#define EXECUTOR_RESULT_TABLE_LIMIT 5
 
 typedef struct {
     int in_use;
@@ -252,11 +253,11 @@ static int executor_get_cached_table(const char *table_name,
 /*
  * 함수명: executor_get_cached_player_indexes
  * ----------------------------------------
- * 기능: players 전용 id/game_win_count B+ 트리 인덱스 세트를 가져온다.
+ * 기능: 테이블의 id/game_win_count B+ 트리 인덱스 세트를 가져온다.
  *
  * 핵심 흐름:
  *   1. 같은 테이블의 인덱스가 캐시에 있으면 재사용한다.
- *   2. 없으면 TableData의 id, game_win_count 컬럼으로 두 B+ 트리를 빌드한다.
+ *   2. 없으면 TableData의 id 컬럼으로 tree를 빌드하고, game_win_count가 있으면 추가 tree를 만든다.
  *   3. INSERT/DELETE 후에는 cache invalidate로 stale row index 문제를 피한다.
  *
  * 개념:
@@ -304,6 +305,36 @@ static int executor_get_cached_player_indexes(const char *table_name,
     executor_index_cache[slot].in_use = 1;
     executor_touch_cache(&executor_index_cache[slot].last_used_tick);
     *out_indexes = &executor_index_cache[slot].indexes;
+    return SUCCESS;
+}
+
+int executor_preload_indexes(const char *table_name, int silent) {
+    const TableData *table;
+    PlayerIndexSet *indexes;
+    double start_ms;
+    double elapsed_ms;
+
+    if (table_name == NULL) {
+        return FAILURE;
+    }
+
+    start_ms = executor_now_ms();
+    if (executor_get_cached_table(table_name, &table) != SUCCESS) {
+        return FAILURE;
+    }
+
+    if (executor_get_cached_player_indexes(table_name, table, &indexes) != SUCCESS) {
+        return FAILURE;
+    }
+
+    elapsed_ms = executor_now_ms() - start_ms;
+    if (!silent) {
+        printf("[준비] %s 테이블을 메모리에 로드하고 B+트리 인덱스를 미리 생성했습니다. "
+               "row=%d, 소요 시간=%.3f ms\n",
+               table_name, table->row_count, elapsed_ms);
+    }
+
+    (void)indexes;
     return SUCCESS;
 }
 
@@ -843,28 +874,35 @@ static int executor_execute_insert(const InsertStatement *stmt) {
     return SUCCESS;
 }
 
-static int executor_table_supports_player_indexes(const TableData *table) {
-    return executor_find_column_index(table->columns, table->col_count, "id") != FAILURE &&
-           executor_find_column_index(table->columns, table->col_count,
-                                      "game_win_count") != FAILURE;
+static int executor_table_has_column(const TableData *table, const char *column_name) {
+    if (table == NULL || column_name == NULL) {
+        return 0;
+    }
+
+    return executor_find_column_index(table->columns, table->col_count,
+                                      column_name) != FAILURE;
 }
 
 static ExecPlan executor_choose_select_plan(const SelectStatement *stmt,
                                             const TableData *table,
                                             ExecMode mode) {
-    int supports_player_indexes;
+    int supports_id_index;
+    int supports_win_index;
 
     if (stmt == NULL || table == NULL || !stmt->has_where) {
         return EXEC_PLAN_FULL_SCAN;
     }
 
-    supports_player_indexes = executor_table_supports_player_indexes(table);
-    if (mode == EXEC_MODE_FORCE_LINEAR || !supports_player_indexes) {
+    if (mode == EXEC_MODE_FORCE_LINEAR) {
         return EXEC_PLAN_LINEAR_SCAN;
     }
 
+    supports_id_index = executor_table_has_column(table, "id");
+    supports_win_index = executor_table_has_column(table, "game_win_count");
+
     if (mode == EXEC_MODE_FORCE_ID_INDEX) {
-        if (!stmt->has_second_where &&
+        if (supports_id_index &&
+            !stmt->has_second_where &&
             strcmp(stmt->where.op, "=") == 0 &&
             utils_equals_ignore_case(stmt->where.column, "id")) {
             return EXEC_PLAN_BPTREE_ID_LOOKUP;
@@ -873,7 +911,8 @@ static ExecPlan executor_choose_select_plan(const SelectStatement *stmt,
     }
 
     if (mode == EXEC_MODE_FORCE_WIN_INDEX) {
-        if (utils_equals_ignore_case(stmt->where.column, "game_win_count")) {
+        if (supports_win_index &&
+            utils_equals_ignore_case(stmt->where.column, "game_win_count")) {
             return EXEC_PLAN_BPTREE_WIN_LOOKUP;
         }
         return EXEC_PLAN_LINEAR_SCAN;
@@ -883,48 +922,37 @@ static ExecPlan executor_choose_select_plan(const SelectStatement *stmt,
      * 일반 SQL 실행에서는 id exact match와 game_win_count 조건을 B+ 트리로 보낸다.
      * 다른 컬럼은 의도적으로 선형 탐색을 사용해 스펙의 비교 기준을 명확히 한다.
      */
-    if (!stmt->has_second_where &&
+    if (supports_id_index &&
+        !stmt->has_second_where &&
         strcmp(stmt->where.op, "=") == 0 &&
         utils_equals_ignore_case(stmt->where.column, "id")) {
         return EXEC_PLAN_BPTREE_ID_LOOKUP;
     }
-    if (utils_equals_ignore_case(stmt->where.column, "game_win_count")) {
+    if (supports_win_index &&
+        utils_equals_ignore_case(stmt->where.column, "game_win_count")) {
         return EXEC_PLAN_BPTREE_WIN_LOOKUP;
     }
 
     return EXEC_PLAN_LINEAR_SCAN;
 }
 
-/*
- * 함수명: executor_execute_select_with_mode
- * ----------------------------------------
- * 기능: SELECT를 실행하되 benchmark용 mode/silent/stats를 지원한다.
- *
- * 핵심 흐름:
- *   1. projection을 준비한다.
- *   2. 실행 계획을 고른다: full scan, linear scan, id B+ tree, win B+ tree.
- *   3. 결과 row를 모으고, silent가 아니면 표를 출력한다.
- *
- * 개념:
- *   - SQL 문법은 그대로 유지하고 mode 플래그만 바꿔 공정한 benchmark를 만든다.
- *   - print I/O는 benchmark 시간 왜곡이 크기 때문에 silent 모드에서 제거한다.
- */
-int executor_execute_select_with_mode(const SelectStatement *stmt, ExecMode mode,
-                                      int silent, ExecStats *stats) {
+static int executor_collect_select_result(const SelectStatement *stmt, ExecMode mode,
+                                          char headers[][MAX_IDENTIFIER_LEN],
+                                          int *selected_count,
+                                          char ****out_rows,
+                                          int *out_row_count,
+                                          ExecStats *stats) {
     const TableData *table;
     PlayerIndexSet *indexes;
     int selected_indices[MAX_COLUMNS];
-    char headers[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
-    int selected_count;
-    char ***result_rows;
-    int result_row_count;
     int status;
     ExecPlan plan;
     long scanned_rows;
     double start_ms;
     double elapsed_ms;
 
-    if (stmt == NULL) {
+    if (stmt == NULL || headers == NULL || selected_count == NULL ||
+        out_rows == NULL || out_row_count == NULL) {
         return FAILURE;
     }
 
@@ -940,24 +968,24 @@ int executor_execute_select_with_mode(const SelectStatement *stmt, ExecMode mode
     }
 
     status = executor_prepare_projection(stmt, table, selected_indices, headers,
-                                         &selected_count);
+                                         selected_count);
     if (status != SUCCESS) {
         return FAILURE;
     }
 
-    result_rows = NULL;
-    result_row_count = 0;
+    *out_rows = NULL;
+    *out_row_count = 0;
     scanned_rows = 0;
     plan = executor_choose_select_plan(stmt, table, mode);
 
     if (plan == EXEC_PLAN_FULL_SCAN) {
-        status = executor_collect_all_rows(table, selected_indices, selected_count,
-                                           &result_rows, &result_row_count);
+        status = executor_collect_all_rows(table, selected_indices, *selected_count,
+                                           out_rows, out_row_count);
         scanned_rows = table->row_count;
     } else if (plan == EXEC_PLAN_LINEAR_SCAN) {
         status = executor_collect_linear_rows(stmt, table, selected_indices,
-                                              selected_count, &result_rows,
-                                              &result_row_count, &scanned_rows);
+                                              *selected_count, out_rows,
+                                              out_row_count, &scanned_rows);
     } else {
         if (executor_get_cached_player_indexes(stmt->table_name, table,
                                                &indexes) != SUCCESS) {
@@ -967,17 +995,17 @@ int executor_execute_select_with_mode(const SelectStatement *stmt, ExecMode mode
         if (plan == EXEC_PLAN_BPTREE_ID_LOOKUP) {
             status = executor_collect_id_indexed_rows(stmt, table, indexes,
                                                       selected_indices,
-                                                      selected_count,
-                                                      &result_rows,
-                                                      &result_row_count);
-            scanned_rows = result_row_count > 0 ? 1 : 0;
+                                                      *selected_count,
+                                                      out_rows,
+                                                      out_row_count);
+            scanned_rows = *out_row_count > 0 ? 1 : 0;
         } else {
             status = executor_collect_win_indexed_rows(stmt, table, indexes,
                                                        selected_indices,
-                                                       selected_count,
-                                                       &result_rows,
-                                                       &result_row_count);
-            scanned_rows = result_row_count;
+                                                       *selected_count,
+                                                       out_rows,
+                                                       out_row_count);
+            scanned_rows = *out_row_count;
         }
     }
 
@@ -988,26 +1016,186 @@ int executor_execute_select_with_mode(const SelectStatement *stmt, ExecMode mode
     elapsed_ms = executor_now_ms() - start_ms;
     if (stats != NULL) {
         stats->plan_used = plan;
-        stats->matched_rows = result_row_count;
+        stats->matched_rows = *out_row_count;
         stats->scanned_rows = scanned_rows;
         stats->elapsed_ms = elapsed_ms;
     }
 
+    return SUCCESS;
+}
+
+static void executor_print_select_result(const ExecStats *stats,
+                                         char headers[][MAX_IDENTIFIER_LEN],
+                                         int selected_count,
+                                         char ***result_rows,
+                                         int show_table) {
+    if (stats == NULL) {
+        return;
+    }
+
+    printf("\n[실행 계획] %s\n", executor_plan_name(stats->plan_used));
+    printf("       %s\n", executor_plan_description(stats->plan_used));
+    printf("       결과 행=%ld, 검사 행=%ld\n",
+           stats->matched_rows, stats->scanned_rows);
+    printf("       +-------------------------+\n");
+    printf("       | 소요 시간: %10.3f ms |\n", stats->elapsed_ms);
+    printf("       +-------------------------+\n\n");
+
+    if (!show_table) {
+        printf("[요약] 비교 출력에서는 결과 표를 한 번만 보여줍니다.\n");
+        return;
+    }
+
+    if (stats->matched_rows > 0 &&
+        stats->matched_rows < EXECUTOR_RESULT_TABLE_LIMIT) {
+        executor_print_table(headers, selected_count, result_rows,
+                             (int)stats->matched_rows);
+        printf("%ld행을 조회했습니다.\n", stats->matched_rows);
+    } else if (stats->matched_rows == 0) {
+        printf("[요약] 조회 결과가 없습니다.\n");
+    } else {
+        printf("[요약] 결과가 %ld행이라 표 출력은 생략했습니다.\n",
+               stats->matched_rows);
+    }
+}
+
+static void executor_print_compare_summary(const ExecStats *linear_stats,
+                                           const ExecStats *index_stats) {
+    double ratio;
+
+    if (linear_stats == NULL || index_stats == NULL) {
+        return;
+    }
+
+    if (index_stats->plan_used == EXEC_PLAN_LINEAR_SCAN ||
+        index_stats->plan_used == EXEC_PLAN_FULL_SCAN) {
+        printf("\n[비교 요약] 이 SQL은 인덱스 조건에 맞지 않아 인덱스 실행도 %s입니다.\n",
+               executor_plan_name(index_stats->plan_used));
+        return;
+    }
+
+    if (linear_stats->elapsed_ms <= 0.0 || index_stats->elapsed_ms <= 0.0) {
+        printf("\n[비교 요약] 실행 시간이 너무 짧아 배율 계산은 생략했습니다.\n");
+        return;
+    }
+
+    if (linear_stats->elapsed_ms > index_stats->elapsed_ms) {
+        ratio = linear_stats->elapsed_ms / index_stats->elapsed_ms;
+        printf("\n[비교 요약] 인덱스 탐색이 선형 탐색보다 약 %.2f배 빠릅니다.\n",
+               ratio);
+    } else if (index_stats->elapsed_ms > linear_stats->elapsed_ms) {
+        ratio = index_stats->elapsed_ms / linear_stats->elapsed_ms;
+        printf("\n[비교 요약] 이번 조건에서는 선형 탐색이 인덱스 탐색보다 약 %.2f배 빠릅니다.\n",
+               ratio);
+    } else {
+        printf("\n[비교 요약] 두 방식의 실행 시간이 거의 같습니다.\n");
+    }
+}
+
+/*
+ * 함수명: executor_execute_select_with_mode
+ * ----------------------------------------
+ * 기능: SELECT를 실행하되 benchmark용 mode/silent/stats를 지원한다.
+ *
+ * 핵심 흐름:
+ *   1. projection을 준비한다.
+ *   2. 실행 계획을 고른다: full scan, linear scan, id B+ tree, win B+ tree.
+ *   3. 결과 row를 모으고, 적은 결과만 표로 출력한다.
+ *
+ * 개념:
+ *   - SQL 문법은 그대로 유지하고 mode 플래그만 바꿔 공정한 benchmark를 만든다.
+ *   - print I/O는 benchmark 시간 왜곡이 크기 때문에 silent 모드에서 제거한다.
+ */
+int executor_execute_select_with_mode(const SelectStatement *stmt, ExecMode mode,
+                                      int silent, ExecStats *stats) {
+    char headers[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
+    int selected_count;
+    char ***result_rows;
+    int result_row_count;
+    int status;
+    ExecStats local_stats;
+
+    if (stmt == NULL) {
+        return FAILURE;
+    }
+
+    result_rows = NULL;
+    result_row_count = 0;
+    status = executor_collect_select_result(stmt, mode, headers, &selected_count,
+                                            &result_rows, &result_row_count,
+                                            &local_stats);
+    if (status != SUCCESS) {
+        return FAILURE;
+    }
+
+    if (stats != NULL) {
+        *stats = local_stats;
+    }
+
     if (!silent) {
-        printf("\n[실행 계획] %s\n", executor_plan_name(plan));
-        printf("       %s\n", executor_plan_description(plan));
-        printf("       결과 행=%d, 검사 행=%ld, 소요 시간=%.3f ms\n\n",
-               result_row_count, scanned_rows, elapsed_ms);
-        if (executor_summary_only) {
-            printf("[요약] 결과 표 출력은 생략했습니다. 총 %d행을 조회했습니다.\n",
-                   result_row_count);
-        } else {
-            executor_print_table(headers, selected_count, result_rows, result_row_count);
-            printf("%d행을 조회했습니다.\n", result_row_count);
-        }
+        executor_print_select_result(&local_stats, headers, selected_count,
+                                     result_rows, 1);
     }
 
     executor_free_result_rows(result_rows, result_row_count, selected_count);
+    return SUCCESS;
+}
+
+int executor_execute_select_compare(const SelectStatement *stmt,
+                                    ExecMode index_mode, int silent) {
+    char linear_headers[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
+    char index_headers[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
+    int linear_selected_count;
+    int index_selected_count;
+    char ***linear_rows;
+    char ***index_rows;
+    int linear_row_count;
+    int index_row_count;
+    ExecStats linear_stats;
+    ExecStats index_stats;
+    int status;
+
+    if (stmt == NULL) {
+        return FAILURE;
+    }
+
+    linear_rows = NULL;
+    index_rows = NULL;
+    linear_row_count = 0;
+    index_row_count = 0;
+
+    status = executor_collect_select_result(stmt, EXEC_MODE_FORCE_LINEAR,
+                                            linear_headers,
+                                            &linear_selected_count,
+                                            &linear_rows, &linear_row_count,
+                                            &linear_stats);
+    if (status != SUCCESS) {
+        return FAILURE;
+    }
+
+    status = executor_collect_select_result(stmt, index_mode, index_headers,
+                                            &index_selected_count,
+                                            &index_rows, &index_row_count,
+                                            &index_stats);
+    if (status != SUCCESS) {
+        executor_free_result_rows(linear_rows, linear_row_count,
+                                  linear_selected_count);
+        return FAILURE;
+    }
+
+    if (!silent) {
+        printf("\n[비교 실행] 같은 SELECT를 선형 탐색과 인덱스 탐색으로 실행했습니다.\n");
+        executor_print_select_result(&linear_stats, linear_headers,
+                                     linear_selected_count, linear_rows, 1);
+        executor_print_select_result(&index_stats, index_headers,
+                                     index_selected_count, index_rows, 0);
+        executor_print_compare_summary(&linear_stats, &index_stats);
+    }
+
+    executor_free_result_rows(linear_rows, linear_row_count,
+                              linear_selected_count);
+    executor_free_result_rows(index_rows, index_row_count,
+                              index_selected_count);
     return SUCCESS;
 }
 
