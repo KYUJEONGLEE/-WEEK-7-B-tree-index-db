@@ -11,6 +11,21 @@ SQL 문법은 새로 만들지 않았습니다. 기존처럼 `SELECT ... WHERE c
 
 ---
 
+## 구현 목표
+
+기존 구조에서 `SELECT ... WHERE ...` 조건은 테이블을 처음부터 끝까지 확인하는 선형 탐색 방식으로 처리했습니다. 선형 탐색은 단순하지만, 데이터가 100만 건 이상으로 늘어나면 조건에 맞는 row를 찾기 위해 많은 row를 검사해야 합니다.
+
+이번 구현에서는 대용량 데이터에서 `id` 기준 조회를 빠르게 처리하기 위해 B+ 트리 인덱스를 추가했습니다.
+
+| 조회 방식 | 탐색 방식 | 대표 조건 |
+| --- | --- | --- |
+| 선형 탐색 | 앞에서부터 row를 순서대로 검사 | `WHERE nickname = ?` |
+| B+ 트리 인덱스 | 정렬된 key를 따라 leaf node까지 탐색 | `WHERE id = ?` |
+
+`id`처럼 고유한 값을 기준으로 단건 조회를 할 때는 선형 탐색의 최악 시간복잡도 `O(n)`과 B+ 트리 탐색의 `O(log n)` 차이를 가장 분명하게 확인할 수 있습니다.
+
+---
+
 ## 현재 데이터
 
 현재 저장소에는 1,000,000건의 플레이어 데이터가 들어 있는 CSV가 포함되어 있습니다.
@@ -118,6 +133,24 @@ typedef struct {
 
 ---
 
+## 중복 Key 처리
+
+`id`는 고유값이므로 하나의 key가 하나의 row를 가리키면 됩니다.
+
+```text
+id -> row_index
+```
+
+반면 `game_win_count`는 같은 승리 횟수를 가진 플레이어가 여러 명 있을 수 있습니다. 따라서 하나의 key에 여러 row index를 연결 리스트로 저장합니다.
+
+```text
+game_win_count -> row_index list
+```
+
+이 구조를 통해 고유 key 인덱스와 중복 key 인덱스를 모두 확인할 수 있습니다.
+
+---
+
 ## 실행 계획
 
 `src/executor.c`의 `executor_choose_select_plan()`이 SELECT 실행 계획을 결정합니다.
@@ -169,85 +202,9 @@ exit
 
 ---
 
-## 실행 예시
+## 실행 옵션
 
-`--summary-only` 옵션을 사용하면 결과 표를 생략하고 실행 계획, 결과 행 수, 검사 행 수, 소요 시간만 볼 수 있습니다.
-
-### 1. id 선형 탐색
-
-```powershell
-docker run -it --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-linear"
-```
-
-입력:
-
-```sql
-SELECT * FROM players WHERE id = 500000;
-```
-
-확인 포인트:
-
-- 실행 계획이 선형 탐색으로 표시됩니다.
-- `id`를 찾기 위해 row를 순서대로 확인합니다.
-
-### 2. id B+트리 인덱스
-
-```powershell
-docker run -it --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-id-index"
-```
-
-입력:
-
-```sql
-SELECT * FROM players WHERE id = 500000;
-```
-
-확인 포인트:
-
-- 실행 계획이 ID B+트리 조회로 표시됩니다.
-- `id`는 고유값이므로 B+트리 효과가 가장 잘 보입니다.
-- 첫 조회는 CSV 로드와 B+트리 생성 시간이 포함될 수 있습니다.
-- 같은 프로그램 안에서 한 번 더 조회하면 캐시된 B+트리를 재사용합니다.
-
-### 3. game_win_count 선형 탐색
-
-```powershell
-docker run -it --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-linear"
-```
-
-입력:
-
-```sql
-SELECT * FROM players WHERE game_win_count > 120;
-```
-
-확인 포인트:
-
-- 조건에 맞는 row가 많으면 선형 탐색도 한 번 훑으면서 결과를 모으기 때문에 단순합니다.
-
-### 4. game_win_count B+트리 인덱스
-
-```powershell
-docker run -it --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-win-index"
-```
-
-입력:
-
-```sql
-SELECT * FROM players WHERE game_win_count > 120;
-```
-
-확인 포인트:
-
-- 실행 계획이 승리 횟수 B+트리 조회로 표시됩니다.
-- `game_win_count`는 중복 key가 있기 때문에 하나의 key가 여러 row index를 가질 수 있습니다.
-- 조건에 맞는 row가 많으면 B+트리도 결국 많은 결과를 가져와야 하므로 항상 빠르지는 않습니다.
-
----
-
-## 선형 탐색과 B+ 트리 직접 비교
-
-같은 SQL을 실행하되, 프로그램 실행 옵션으로 경로를 강제할 수 있습니다.
+같은 SQL을 실행하더라도 프로그램 실행 옵션으로 조회 경로를 강제할 수 있습니다.
 
 | 옵션 | 설명 |
 | --- | --- |
@@ -257,17 +214,7 @@ SELECT * FROM players WHERE game_win_count > 120;
 | `--summary-only` | SELECT 결과 표 생략, 요약만 출력 |
 | `--silent` | INSERT/SELECT/DELETE 출력 제거 |
 
-파일로 한 번에 비교하려면 아래 SQL 파일을 사용할 수 있습니다.
-
-```powershell
-docker run --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-linear bench/select_id_500000_twice.sql"
-```
-
-```powershell
-docker run --rm -v "C:\Users\KJ\Workspace\mini_sql_btree:/app" -w /app mini-sql-btree:test /bin/sh -lc "make && ./sql_processor --summary-only --force-id-index bench/select_id_500000_twice.sql"
-```
-
-`twice` 파일은 같은 SELECT를 두 번 실행합니다. 첫 번째 조회와 두 번째 조회의 차이를 보여주기 좋습니다.
+`--summary-only`는 결과 표를 생략하고 실행 계획, 결과 행 수, 검사 행 수, 소요 시간만 출력합니다.
 
 ---
 
@@ -288,7 +235,7 @@ SELECT * FROM players WHERE game_win_count = 150;
 승리 횟수 조회, 결과 많음:
 
 ```sql
-SELECT * FROM players WHERE game_win_count > 120;
+SELECT * FROM players WHERE game_win_count > 50;
 ```
 
 선형 탐색 비교용:
@@ -299,9 +246,9 @@ SELECT * FROM players WHERE nickname = 'player_500000';
 
 ---
 
-## 첫 조회가 느린 이유
+## 첫 조회와 캐시 효과
 
-현재 B+ 트리는 디스크에 저장하지 않고 메모리에만 생성합니다.
+현재 B+ 트리는 디스크에 저장하지 않고 메모리에만 생성합니다. 또한 100만 건 CSV를 읽어 메모리에 올리는 과정 자체도 비용이 큽니다.
 
 첫 B+ 트리 조회:
 
@@ -311,14 +258,16 @@ CSV 100만 건 로드
 -> B+ 트리 조회
 ```
 
-두 번째 B+ 트리 조회:
+같은 프로그램 안에서 두 번째 B+ 트리 조회:
 
 ```text
 이미 만들어진 B+ 트리 캐시 재사용
 -> 바로 조회
 ```
 
-따라서 첫 조회는 느리고, 같은 프로그램 실행 중 두 번째 조회부터 빨라집니다.
+선형 탐색도 두 번째 실행부터 빨라질 수 있습니다. 이 경우는 탐색 알고리즘이 바뀐 것이 아니라, 첫 조회 때 읽은 CSV 데이터가 운영체제 파일 캐시나 프로그램 내부 캐시에 남아 있기 때문입니다.
+
+즉, 두 번째 조회가 빨라져도 선형 탐색은 여전히 조건을 순서대로 검사하는 `O(n)` 방식입니다. B+ 트리와 선형 탐색의 차이를 보려면 첫 실행 한 번보다 반복 조회나 평균 시간을 함께 보는 것이 더 적절합니다.
 
 ---
 
