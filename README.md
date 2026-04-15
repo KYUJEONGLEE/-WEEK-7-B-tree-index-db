@@ -357,10 +357,14 @@ total_game_count: game_win_count + game_loss_count
 ./sql_processor --silent bench/insert_1m_players.sql
 ```
 
-`players` 전용 대량 INSERT는 `--bulk-insert` 옵션으로 더 빠르게 처리할 수 있습니다. 이 경로는 SQL 문법은 그대로 파싱하지만, CSV 파일을 한 번만 열고 `players.meta`는 마지막에 한 번만 갱신합니다.
+`players`와 `insert_test_records` 대량 INSERT는 `--bulk-insert` 옵션으로 더 빠르게 처리할 수 있습니다. 이 경로는 SQL 문법은 그대로 파싱하지만, CSV 파일을 한 번만 열고 meta 파일은 마지막에 한 번만 갱신합니다.
 
 ```bash
 ./sql_processor --bulk-insert --silent bench/insert_1m_players.sql
+```
+
+```bash
+./sql_processor --bulk-insert --silent bench/insert_1m_insert_test_records.sql
 ```
 
 참고: `bench/insert_1m_players.sql`은 100MB가 넘어서 Git에는 올리지 않았습니다. 대신 실제 데이터 파일인 `data/players.csv`를 저장소에 포함했습니다.

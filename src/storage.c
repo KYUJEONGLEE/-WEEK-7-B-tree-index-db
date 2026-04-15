@@ -1509,6 +1509,197 @@ void storage_players_bulk_abort(PlayersBulkInsert *bulk) {
     bulk->active = 0;
 }
 
+static int storage_validate_insert_test_records_header(
+        const char columns[][MAX_IDENTIFIER_LEN], int col_count) {
+    static const char *expected[] = {
+        "id", "nickname", "category", "score", "level", "status"
+    };
+    int i;
+
+    if (col_count != 6) {
+        return FAILURE;
+    }
+
+    for (i = 0; i < 6; i++) {
+        if (!utils_equals_ignore_case(columns[i], expected[i])) {
+            return FAILURE;
+        }
+    }
+
+    return SUCCESS;
+}
+
+int storage_insert_test_records_bulk_begin(const char *table_name,
+                                           InsertTestRecordsBulkInsert *bulk) {
+    static const char *headers[] = {
+        "id", "nickname", "category", "score", "level", "status"
+    };
+    char path[MAX_PATH_LEN];
+    char existing_columns[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
+    char next_id_value[MAX_VALUE_LEN];
+    int existing_count;
+
+    if (table_name == NULL || bulk == NULL ||
+        !utils_equals_ignore_case(table_name, "insert_test_records")) {
+        return FAILURE;
+    }
+
+    memset(bulk, 0, sizeof(*bulk));
+    if (utils_safe_strcpy(bulk->table_name, sizeof(bulk->table_name),
+                          table_name) != SUCCESS ||
+        storage_ensure_data_dir() != SUCCESS ||
+        storage_build_path(table_name, path, sizeof(path)) != SUCCESS) {
+        return FAILURE;
+    }
+
+    bulk->fp = fopen(path, "a+");
+    if (bulk->fp == NULL) {
+        fprintf(stderr, "Error: Failed to open table '%s'.\n", table_name);
+        return FAILURE;
+    }
+
+    if (storage_lock_file(bulk->fp, LOCK_EX) != SUCCESS) {
+        fclose(bulk->fp);
+        memset(bulk, 0, sizeof(*bulk));
+        return FAILURE;
+    }
+
+    rewind(bulk->fp);
+    if (storage_read_header(bulk->fp, existing_columns, &existing_count) != SUCCESS) {
+        storage_insert_test_records_bulk_abort(bulk);
+        return FAILURE;
+    }
+
+    if (existing_count == 0) {
+        if (storage_write_csv_row(bulk->fp, headers, 6) != SUCCESS) {
+            fprintf(stderr, "Error: Failed to write insert_test_records header.\n");
+            storage_insert_test_records_bulk_abort(bulk);
+            return FAILURE;
+        }
+        bulk->next_id = 1;
+    } else {
+        if (storage_validate_insert_test_records_header(existing_columns,
+                                                        existing_count) != SUCCESS) {
+            fprintf(stderr, "Error: insert_test_records table schema is invalid.\n");
+            storage_insert_test_records_bulk_abort(bulk);
+            return FAILURE;
+        }
+
+        if (storage_get_meta_next_auto_id(bulk->fp, table_name, existing_columns,
+                                          existing_count, next_id_value,
+                                          sizeof(next_id_value)) != SUCCESS) {
+            storage_insert_test_records_bulk_abort(bulk);
+            return FAILURE;
+        }
+        bulk->next_id = utils_parse_integer(next_id_value);
+    }
+
+    if (fseek(bulk->fp, 0, SEEK_END) != 0) {
+        fprintf(stderr, "Error: Failed to append to table '%s'.\n", table_name);
+        storage_insert_test_records_bulk_abort(bulk);
+        return FAILURE;
+    }
+
+    bulk->active = 1;
+    return SUCCESS;
+}
+
+int storage_insert_test_records_bulk_insert(InsertTestRecordsBulkInsert *bulk,
+                                            const InsertStatement *stmt) {
+    int nickname_index;
+    int category_index;
+    int score_index;
+    int level_index;
+    int status_index;
+    char id_value[MAX_VALUE_LEN];
+    const char *ordered_values[6];
+
+    if (bulk == NULL || stmt == NULL || bulk->fp == NULL || !bulk->active ||
+        !utils_equals_ignore_case(stmt->table_name, "insert_test_records")) {
+        return FAILURE;
+    }
+
+    nickname_index = storage_find_statement_column(stmt, "nickname");
+    category_index = storage_find_statement_column(stmt, "category");
+    score_index = storage_find_statement_column(stmt, "score");
+    level_index = storage_find_statement_column(stmt, "level");
+    status_index = storage_find_statement_column(stmt, "status");
+    if (nickname_index == FAILURE || category_index == FAILURE ||
+        score_index == FAILURE || level_index == FAILURE ||
+        status_index == FAILURE) {
+        fprintf(stderr,
+                "Error: insert_test_records INSERT requires nickname, category, score, level, and status.\n");
+        return FAILURE;
+    }
+
+    if (!utils_is_integer(stmt->values[score_index]) ||
+        !utils_is_integer(stmt->values[level_index])) {
+        fprintf(stderr, "Error: score and level must be integer values.\n");
+        return FAILURE;
+    }
+
+    snprintf(id_value, sizeof(id_value), "%lld", bulk->next_id);
+    ordered_values[0] = id_value;
+    ordered_values[1] = stmt->values[nickname_index];
+    ordered_values[2] = stmt->values[category_index];
+    ordered_values[3] = stmt->values[score_index];
+    ordered_values[4] = stmt->values[level_index];
+    ordered_values[5] = stmt->values[status_index];
+
+    if (storage_write_csv_row(bulk->fp, ordered_values, 6) != SUCCESS) {
+        fprintf(stderr, "Error: Failed to write table '%s'.\n", bulk->table_name);
+        return FAILURE;
+    }
+
+    bulk->next_id++;
+    bulk->inserted_count++;
+    return SUCCESS;
+}
+
+int storage_insert_test_records_bulk_finish(InsertTestRecordsBulkInsert *bulk) {
+    int status;
+
+    if (bulk == NULL || bulk->fp == NULL || !bulk->active) {
+        return FAILURE;
+    }
+
+    status = SUCCESS;
+    if (fflush(bulk->fp) != 0) {
+        status = FAILURE;
+    }
+
+    flock(fileno(bulk->fp), LOCK_UN);
+    fclose(bulk->fp);
+    bulk->fp = NULL;
+    bulk->active = 0;
+
+    if (status == SUCCESS &&
+        storage_write_meta_next_id(bulk->table_name, bulk->next_id) != SUCCESS) {
+        status = FAILURE;
+    }
+
+    return status;
+}
+
+void storage_insert_test_records_bulk_abort(InsertTestRecordsBulkInsert *bulk) {
+    if (bulk == NULL) {
+        return;
+    }
+
+    if (bulk->fp != NULL) {
+        fflush(bulk->fp);
+        flock(fileno(bulk->fp), LOCK_UN);
+        fclose(bulk->fp);
+        bulk->fp = NULL;
+    }
+
+    if (bulk->active && bulk->inserted_count > 0) {
+        storage_write_meta_next_id(bulk->table_name, bulk->next_id);
+    }
+
+    bulk->active = 0;
+}
+
 /*
  * 행 하나를 테이블에 삽입한다.
  * 필요하면 CSV 파일과 스키마를 만들고 auto-increment id와 기본 키 검사를 처리한다.

@@ -151,7 +151,7 @@ static int main_run_file_mode(const char *path)
 }
 
 /*
- * players INSERT 전용 bulk 파일 모드.
+ * 지원 테이블 전용 bulk 파일 모드.
  * SQL 문법은 그대로 파싱하되 CSV 파일은 한 번만 열고 meta는 마지막에 한 번만 갱신한다.
  */
 static int main_run_bulk_insert_mode(const char *path, int silent)
@@ -162,9 +162,11 @@ static int main_run_bulk_insert_mode(const char *path, int silent)
     char *statement_sql;
     char *remaining;
     SqlStatement statement;
-    PlayersBulkInsert bulk;
+    PlayersBulkInsert players_bulk;
+    InsertTestRecordsBulkInsert records_bulk;
     int is_empty;
     int bulk_started;
+    int bulk_kind;
     int status;
 
     content = utils_read_file(path);
@@ -173,8 +175,10 @@ static int main_run_bulk_insert_mode(const char *path, int silent)
         return FAILURE;
     }
 
-    memset(&bulk, 0, sizeof(bulk));
+    memset(&players_bulk, 0, sizeof(players_bulk));
+    memset(&records_bulk, 0, sizeof(records_bulk));
     bulk_started = 0;
+    bulk_kind = 0;
     status = SUCCESS;
 
     start = 0;
@@ -222,27 +226,56 @@ static int main_run_bulk_insert_mode(const char *path, int silent)
 
         if (!is_empty)
         {
-            if (statement.type != SQL_INSERT ||
-                !utils_equals_ignore_case(statement.insert.table_name, "players"))
+            if (statement.type != SQL_INSERT)
             {
                 fprintf(stderr,
-                        "Error: --bulk-insert only supports INSERT INTO players statements.\n");
+                        "Error: --bulk-insert only supports INSERT statements.\n");
+                status = FAILURE;
+                break;
+            }
+
+            if (!utils_equals_ignore_case(statement.insert.table_name, "players") &&
+                !utils_equals_ignore_case(statement.insert.table_name,
+                                          "insert_test_records"))
+            {
+                fprintf(stderr,
+                        "Error: --bulk-insert supports players and insert_test_records tables only.\n");
                 status = FAILURE;
                 break;
             }
 
             if (!bulk_started)
             {
-                if (storage_players_bulk_begin(statement.insert.table_name,
-                                               &bulk) != SUCCESS)
+                if (utils_equals_ignore_case(statement.insert.table_name, "players"))
                 {
-                    status = FAILURE;
-                    break;
+                    if (storage_players_bulk_begin(statement.insert.table_name,
+                                                   &players_bulk) != SUCCESS)
+                    {
+                        status = FAILURE;
+                        break;
+                    }
+                    bulk_kind = 1;
+                }
+                else
+                {
+                    if (storage_insert_test_records_bulk_begin(
+                            statement.insert.table_name,
+                            &records_bulk) != SUCCESS)
+                    {
+                        status = FAILURE;
+                        break;
+                    }
+                    bulk_kind = 2;
                 }
                 bulk_started = 1;
             }
 
-            if (storage_players_bulk_insert(&bulk, &statement.insert) != SUCCESS)
+            if ((bulk_kind == 1 &&
+                 storage_players_bulk_insert(&players_bulk,
+                                             &statement.insert) != SUCCESS) ||
+                (bulk_kind == 2 &&
+                 storage_insert_test_records_bulk_insert(
+                     &records_bulk, &statement.insert) != SUCCESS))
             {
                 status = FAILURE;
                 break;
@@ -258,16 +291,33 @@ static int main_run_bulk_insert_mode(const char *path, int silent)
     {
         if (status == SUCCESS)
         {
-            status = storage_players_bulk_finish(&bulk);
+            if (bulk_kind == 1)
+            {
+                status = storage_players_bulk_finish(&players_bulk);
+            }
+            else
+            {
+                status = storage_insert_test_records_bulk_finish(&records_bulk);
+            }
+
             if (status == SUCCESS && !silent)
             {
-                printf("[성공] players 테이블에 %ld행을 bulk INSERT했습니다.\n",
-                       bulk.inserted_count);
+                printf("[성공] %s 테이블에 %ld행을 bulk INSERT했습니다.\n",
+                       bulk_kind == 1 ? players_bulk.table_name : records_bulk.table_name,
+                       bulk_kind == 1 ? players_bulk.inserted_count :
+                                        records_bulk.inserted_count);
             }
         }
         else
         {
-            storage_players_bulk_abort(&bulk);
+            if (bulk_kind == 1)
+            {
+                storage_players_bulk_abort(&players_bulk);
+            }
+            else if (bulk_kind == 2)
+            {
+                storage_insert_test_records_bulk_abort(&records_bulk);
+            }
         }
     }
 

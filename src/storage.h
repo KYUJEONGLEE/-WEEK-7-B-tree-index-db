@@ -21,6 +21,14 @@ typedef struct {
     int active;
 } PlayersBulkInsert;
 
+typedef struct {
+    FILE *fp;
+    char table_name[MAX_IDENTIFIER_LEN];
+    long long next_id;
+    long inserted_count;
+    int active;
+} InsertTestRecordsBulkInsert;
+
 /*
  * 테이블 CSV 파일에 행 하나를 추가한다.
  * 성공 시 SUCCESS, 실패 시 FAILURE를 반환한다.
@@ -48,6 +56,16 @@ int storage_players_bulk_finish(PlayersBulkInsert *bulk);
  * bulk INSERT 세션을 닫는다. 이미 쓴 row가 있으면 meta를 현재 next_id로 맞춘다.
  */
 void storage_players_bulk_abort(PlayersBulkInsert *bulk);
+
+/*
+ * insert_test_records 전용 bulk INSERT 세션.
+ */
+int storage_insert_test_records_bulk_begin(const char *table_name,
+                                           InsertTestRecordsBulkInsert *bulk);
+int storage_insert_test_records_bulk_insert(InsertTestRecordsBulkInsert *bulk,
+                                            const InsertStatement *stmt);
+int storage_insert_test_records_bulk_finish(InsertTestRecordsBulkInsert *bulk);
+void storage_insert_test_records_bulk_abort(InsertTestRecordsBulkInsert *bulk);
 
 /*
  * 테이블 CSV 파일에서 조건에 맞는 행을 삭제한다.
