@@ -5,6 +5,9 @@ TEST_DIR = tests
 BUILD_DIR = build
 TARGET = sql_processor
 TEST_BIN_DIR = $(BUILD_DIR)/tests
+BENCH_TARGET = $(BUILD_DIR)/benchmark
+BENCH_ROWS ?= 1000000
+BENCH_QUERIES ?= 1000
 
 MAIN_SRCS = $(filter-out $(SRC_DIR)/main.c,$(wildcard $(SRC_DIR)/*.c))
 SRCS = $(wildcard $(SRC_DIR)/*.c)
@@ -33,7 +36,13 @@ $(TEST_BIN_DIR):
 tests: $(TARGET) $(TEST_BINS)
 	bash $(TEST_DIR)/run_tests.sh
 
-clean:
-	rm -rf $(BUILD_DIR) $(TARGET) data/*.csv
+benchmark: $(BENCH_TARGET)
+	$(BENCH_TARGET) $(BENCH_ROWS) $(BENCH_QUERIES)
 
-.PHONY: all tests clean
+$(BENCH_TARGET): bench/benchmark.c $(CORE_OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS)
+
+clean:
+	rm -rf $(BUILD_DIR) $(TARGET) data/*.csv data/*.meta
+
+.PHONY: all tests benchmark clean

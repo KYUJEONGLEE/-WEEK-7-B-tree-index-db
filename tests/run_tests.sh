@@ -39,18 +39,20 @@ run_sql_test() {
 }
 
 for binary in build/tests/test_tokenizer build/tests/test_parser \
-              build/tests/test_storage build/tests/test_executor
+              build/tests/test_storage build/tests/test_bptree \
+              build/tests/test_index build/tests/test_executor
 do
     run_unit_test "$binary"
 done
 
-run_sql_test "Basic INSERT" "tests/test_cases/basic_insert.sql" "1 row inserted into users."
+run_sql_test "Basic INSERT" "tests/test_cases/basic_insert.sql" "users 테이블에 1행을 삽입했습니다."
 run_sql_test "Basic SELECT" "tests/test_cases/basic_select.sql" "Alice"
 run_sql_test "WHERE equals" "tests/test_cases/select_where.sql" "Bob"
 run_sql_test "Edge cases" "tests/test_cases/edge_cases.sql" "Lee, Jr."
 run_sql_test "Duplicate primary key" "tests/test_cases/duplicate_primary_key.sql" "Duplicate primary key value"
-run_sql_test "Delete WHERE" "tests/test_cases/delete_where.sql" "1 row deleted from users."
-run_sql_test "Delete grouped slot" "tests/test_cases/delete_grouped_slot.sql" "5 rows deleted from jungle_menu."
+run_sql_test "Delete WHERE" "tests/test_cases/delete_where.sql" "users 테이블에서 1행을 삭제했습니다."
+run_sql_test "Delete grouped slot" "tests/test_cases/delete_grouped_slot.sql" "jungle_menu 테이블에서 5행을 삭제했습니다."
+run_sql_test "Players B+ tree flow" "tests/test_cases/players_bptree.sql" "player_3"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

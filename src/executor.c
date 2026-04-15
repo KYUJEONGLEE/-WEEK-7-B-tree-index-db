@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define EXECUTOR_TABLE_CACHE_LIMIT 8
 #define EXECUTOR_INDEX_CACHE_LIMIT 16
@@ -21,8 +22,7 @@ typedef struct {
     int in_use;
     unsigned long last_used_tick;
     char table_name[MAX_IDENTIFIER_LEN];
-    char column_name[MAX_IDENTIFIER_LEN];
-    TableIndex index;
+    PlayerIndexSet indexes;
 } ExecutorIndexCacheEntry;
 
 static ExecutorTableCacheEntry executor_table_cache[EXECUTOR_TABLE_CACHE_LIMIT];
@@ -30,6 +30,55 @@ static ExecutorIndexCacheEntry executor_index_cache[EXECUTOR_INDEX_CACHE_LIMIT];
 static unsigned long executor_cache_tick = 0;
 static int executor_table_cache_hit_count = 0;
 static int executor_index_cache_hit_count = 0;
+static int executor_silent_output = 0;
+static int executor_summary_only = 0;
+static ExecMode executor_default_mode = EXEC_MODE_NORMAL;
+
+static double executor_now_ms(void) {
+    return ((double)clock() * 1000.0) / (double)CLOCKS_PER_SEC;
+}
+
+void executor_set_silent(int silent) {
+    executor_silent_output = silent ? 1 : 0;
+}
+
+void executor_set_mode(ExecMode mode) {
+    executor_default_mode = mode;
+}
+
+void executor_set_summary_only(int summary_only) {
+    executor_summary_only = summary_only ? 1 : 0;
+}
+
+static const char *executor_plan_name(ExecPlan plan) {
+    switch (plan) {
+        case EXEC_PLAN_FULL_SCAN:
+            return "전체 조회";
+        case EXEC_PLAN_LINEAR_SCAN:
+            return "선형 탐색";
+        case EXEC_PLAN_BPTREE_ID_LOOKUP:
+            return "ID B+트리 조회";
+        case EXEC_PLAN_BPTREE_WIN_LOOKUP:
+            return "승리 횟수 B+트리 조회";
+        default:
+            return "없음";
+    }
+}
+
+static const char *executor_plan_description(ExecPlan plan) {
+    switch (plan) {
+        case EXEC_PLAN_FULL_SCAN:
+            return "WHERE 없음: 전체 테이블 출력";
+        case EXEC_PLAN_LINEAR_SCAN:
+            return "인덱스 미사용: row를 처음부터 끝까지 비교";
+        case EXEC_PLAN_BPTREE_ID_LOOKUP:
+            return "B+ 트리 사용: id -> row index";
+        case EXEC_PLAN_BPTREE_WIN_LOOKUP:
+            return "B+ 트리 사용: game_win_count -> row index list";
+        default:
+            return "실행 계획 없음";
+    }
+}
 
 /*
  * 캐시 엔트리를 최근 사용 시점으로 갱신한다.
@@ -76,7 +125,7 @@ static void executor_clear_index_cache_entry(ExecutorIndexCacheEntry *entry) {
         return;
     }
 
-    index_free(&entry->index);
+    index_free_player_indexes(&entry->indexes);
     memset(entry, 0, sizeof(*entry));
 }
 
@@ -201,17 +250,26 @@ static int executor_get_cached_table(const char *table_name,
 }
 
 /*
- * 같은 실행 중 같은 테이블·컬럼 조합이면 기존 인덱스를 재사용하고,
- * 없으면 한 번 생성해 캐시에 넣는다.
+ * 함수명: executor_get_cached_player_indexes
+ * ----------------------------------------
+ * 기능: players 전용 id/game_win_count B+ 트리 인덱스 세트를 가져온다.
+ *
+ * 핵심 흐름:
+ *   1. 같은 테이블의 인덱스가 캐시에 있으면 재사용한다.
+ *   2. 없으면 TableData의 id, game_win_count 컬럼으로 두 B+ 트리를 빌드한다.
+ *   3. INSERT/DELETE 후에는 cache invalidate로 stale row index 문제를 피한다.
+ *
+ * 개념:
+ *   - DELETE는 CSV를 재작성해 row index가 바뀔 수 있으므로 직접 tree delete를 하지 않는다.
+ *   - 다음 조회 때 다시 빌드하는 방식이 가장 단순하고 안전하다.
  */
-static int executor_get_cached_index(const char *table_name, const char *column_name,
-                                     const TableData *table, TableIndex **out_index) {
+static int executor_get_cached_player_indexes(const char *table_name,
+                                              const TableData *table,
+                                              PlayerIndexSet **out_indexes) {
     int i;
     int slot;
-    int column_index;
 
-    if (table_name == NULL || column_name == NULL || table == NULL ||
-        out_index == NULL) {
+    if (table_name == NULL || table == NULL || out_indexes == NULL) {
         return FAILURE;
     }
 
@@ -220,34 +278,24 @@ static int executor_get_cached_index(const char *table_name, const char *column_
             continue;
         }
 
-        if (utils_equals_ignore_case(executor_index_cache[i].table_name, table_name) &&
-            utils_equals_ignore_case(executor_index_cache[i].column_name, column_name)) {
+        if (utils_equals_ignore_case(executor_index_cache[i].table_name, table_name)) {
             executor_touch_cache(&executor_index_cache[i].last_used_tick);
             executor_index_cache_hit_count++;
-            *out_index = &executor_index_cache[i].index;
+            *out_indexes = &executor_index_cache[i].indexes;
             return SUCCESS;
         }
     }
 
-    column_index = executor_find_column_index(table->columns, table->col_count,
-                                              column_name);
-    if (column_index == FAILURE) {
-        fprintf(stderr, "Error: Column '%s' not found.\n", column_name);
-        return FAILURE;
-    }
-
     slot = executor_choose_index_cache_slot();
     executor_clear_index_cache_entry(&executor_index_cache[slot]);
-    if (index_build(table, column_index, &executor_index_cache[slot].index) != SUCCESS) {
+    if (index_build_player_indexes(table,
+                                   &executor_index_cache[slot].indexes) != SUCCESS) {
         return FAILURE;
     }
 
     if (utils_safe_strcpy(executor_index_cache[slot].table_name,
                           sizeof(executor_index_cache[slot].table_name),
-                          table_name) != SUCCESS ||
-        utils_safe_strcpy(executor_index_cache[slot].column_name,
-                          sizeof(executor_index_cache[slot].column_name),
-                          column_name) != SUCCESS) {
+                          table_name) != SUCCESS) {
         fprintf(stderr, "Error: Identifier is too long.\n");
         executor_clear_index_cache_entry(&executor_index_cache[slot]);
         return FAILURE;
@@ -255,7 +303,7 @@ static int executor_get_cached_index(const char *table_name, const char *column_
 
     executor_index_cache[slot].in_use = 1;
     executor_touch_cache(&executor_index_cache[slot].last_used_tick);
-    *out_index = &executor_index_cache[slot].index;
+    *out_indexes = &executor_index_cache[slot].indexes;
     return SUCCESS;
 }
 
@@ -392,25 +440,6 @@ static void executor_print_table(char headers[][MAX_IDENTIFIER_LEN], int header_
 }
 
 /*
- * 두 행 오프셋을 비교해 인덱스 결과를 파일 순서로 다시 정렬한다.
- */
-static int executor_compare_offsets(const void *lhs, const void *rhs) {
-    long left;
-    long right;
-
-    left = *(const long *)lhs;
-    right = *(const long *)rhs;
-
-    if (left < right) {
-        return -1;
-    }
-    if (left > right) {
-        return 1;
-    }
-    return 0;
-}
-
-/*
  * SELECT 대상 컬럼을 원본 테이블 인덱스와 출력 헤더로 변환한다.
  * 요청된 컬럼이 모두 존재하면 SUCCESS를 반환한다.
  */
@@ -492,72 +521,240 @@ static int executor_collect_all_rows(const TableData *table,
     return SUCCESS;
 }
 
+static int executor_compare_with_operator(const char *lhs, const char *op,
+                                          const char *rhs) {
+    int comparison;
+
+    if (lhs == NULL || op == NULL || rhs == NULL) {
+        return FAILURE;
+    }
+
+    comparison = utils_compare_values(lhs, rhs);
+    if (strcmp(op, "=") == 0) {
+        return comparison == 0;
+    }
+    if (strcmp(op, "!=") == 0) {
+        return comparison != 0;
+    }
+    if (strcmp(op, ">") == 0) {
+        return comparison > 0;
+    }
+    if (strcmp(op, "<") == 0) {
+        return comparison < 0;
+    }
+    if (strcmp(op, ">=") == 0) {
+        return comparison >= 0;
+    }
+    if (strcmp(op, "<=") == 0) {
+        return comparison <= 0;
+    }
+
+    return FAILURE;
+}
+
 /*
- * 재사용 가능한 인덱스를 이용해 일치하는 오프셋만 찾아 필요한 행만 읽는다.
- * 성공 시 out_rows의 소유권은 호출자에게 있다.
+ * 함수명: executor_collect_linear_rows
+ * ----------------------------------------
+ * 기능: 인덱스를 쓰지 않고 TableData.rows를 직접 순회해 WHERE를 평가한다.
+ *
+ * 핵심 흐름:
+ *   1. WHERE 컬럼 위치를 찾는다.
+ *   2. 모든 row를 순회하면서 조건을 비교한다.
+ *   3. 조건을 만족하는 row만 projection 결과로 복사한다.
+ *
+ * 개념:
+ *   - nickname, game_loss_count, total_game_count는 의도적으로 선형 탐색이다.
+ *   - benchmark에서 B+ 트리와 비교하기 위한 기준 경로가 된다.
  */
-static int executor_collect_indexed_rows(const SelectStatement *stmt,
-                                         const TableData *table,
-                                         const TableIndex *index,
-                                         const int *selected_indices,
-                                         int selected_count,
-                                         char ****out_rows, int *out_row_count) {
-    long *offsets;
-    int match_count;
+static int executor_collect_linear_rows(const SelectStatement *stmt,
+                                        const TableData *table,
+                                        const int *selected_indices,
+                                        int selected_count,
+                                        char ****out_rows, int *out_row_count,
+                                        long *scanned_rows) {
+    int where_index;
     int i;
+    int matches;
     char ***result_rows;
-    char **full_row;
 
-    if (stmt == NULL || table == NULL || index == NULL ||
-        selected_indices == NULL || out_rows == NULL || out_row_count == NULL) {
+    if (stmt == NULL || table == NULL || selected_indices == NULL ||
+        out_rows == NULL || out_row_count == NULL) {
         return FAILURE;
     }
 
-    offsets = NULL;
-    match_count = 0;
-    if (strcmp(stmt->where.op, "=") == 0) {
-        if (index_query_equals(index, stmt->where.value, &offsets,
-                               &match_count) != SUCCESS) {
-            return FAILURE;
-        }
-    } else {
-        if (index_query_range(index, stmt->where.op, stmt->where.value,
-                              &offsets, &match_count) != SUCCESS) {
-            return FAILURE;
-        }
-    }
-
-    if (match_count > 1) {
-        qsort(offsets, (size_t)match_count, sizeof(long), executor_compare_offsets);
-    }
-
-    if (executor_allocate_result_rows(&result_rows, match_count) != SUCCESS) {
-        free(offsets);
+    where_index = executor_find_column_index(table->columns, table->col_count,
+                                             stmt->where.column);
+    if (where_index == FAILURE) {
+        fprintf(stderr, "Error: Column '%s' not found.\n", stmt->where.column);
         return FAILURE;
     }
 
-    for (i = 0; i < match_count; i++) {
-        if (storage_read_row_at_offset(stmt->table_name, offsets[i], table->col_count,
-                                       &full_row) != SUCCESS) {
-            executor_free_result_rows(result_rows, i, selected_count);
-            free(offsets);
-            return FAILURE;
-        }
-
-        if (executor_copy_projected_row(result_rows, i, full_row, selected_indices,
-                                        selected_count) != SUCCESS) {
-            storage_free_row(full_row, table->col_count);
-            executor_free_result_rows(result_rows, i, selected_count);
-            free(offsets);
-            return FAILURE;
-        }
-
-        storage_free_row(full_row, table->col_count);
+    if (executor_allocate_result_rows(&result_rows, table->row_count) != SUCCESS) {
+        return FAILURE;
     }
 
-    free(offsets);
+    *out_row_count = 0;
+    if (scanned_rows != NULL) {
+        *scanned_rows = 0;
+    }
+
+    for (i = 0; i < table->row_count; i++) {
+        if (scanned_rows != NULL) {
+            (*scanned_rows)++;
+        }
+
+        matches = executor_compare_with_operator(table->rows[i][where_index],
+                                                 stmt->where.op,
+                                                 stmt->where.value);
+        if (matches == FAILURE) {
+            executor_free_result_rows(result_rows, *out_row_count, selected_count);
+            return FAILURE;
+        }
+
+        if (!matches) {
+            continue;
+        }
+
+        if (executor_copy_projected_row(result_rows, *out_row_count, table->rows[i],
+                                        selected_indices, selected_count) != SUCCESS) {
+            executor_free_result_rows(result_rows, *out_row_count, selected_count);
+            return FAILURE;
+        }
+        (*out_row_count)++;
+    }
+
     *out_rows = result_rows;
-    *out_row_count = match_count;
+    return SUCCESS;
+}
+
+/*
+ * 함수명: executor_collect_id_indexed_rows
+ * ----------------------------------------
+ * 기능: WHERE id = ? 조건을 id B+ 트리로 exact lookup 한다.
+ *
+ * 개념:
+ *   - id는 unique key라 결과가 0건 또는 1건이다.
+ *   - tree value는 TableData.rows의 row index라 파일을 다시 읽지 않는다.
+ */
+static int executor_collect_id_indexed_rows(const SelectStatement *stmt,
+                                            const TableData *table,
+                                            PlayerIndexSet *indexes,
+                                            const int *selected_indices,
+    int selected_count,
+    char ****out_rows,
+    int *out_row_count) {
+    long long id;
+    int row_index;
+    char ***result_rows;
+
+    if (stmt == NULL || table == NULL || indexes == NULL ||
+        out_rows == NULL || out_row_count == NULL) {
+        return FAILURE;
+    }
+
+    if (!utils_is_integer(stmt->where.value)) {
+        *out_rows = NULL;
+        *out_row_count = 0;
+        return SUCCESS;
+    }
+
+    id = utils_parse_integer(stmt->where.value);
+    if (index_search_by_id(indexes, id, &row_index) != SUCCESS) {
+        *out_rows = NULL;
+        *out_row_count = 0;
+        return SUCCESS;
+    }
+
+    if (row_index < 0 || row_index >= table->row_count) {
+        return FAILURE;
+    }
+
+    if (executor_allocate_result_rows(&result_rows, 1) != SUCCESS) {
+        return FAILURE;
+    }
+
+    if (executor_copy_projected_row(result_rows, 0, table->rows[row_index],
+                                    selected_indices, selected_count) != SUCCESS) {
+        executor_free_result_rows(result_rows, 0, selected_count);
+        return FAILURE;
+    }
+
+    *out_rows = result_rows;
+    *out_row_count = 1;
+    return SUCCESS;
+}
+
+/*
+ * 함수명: executor_collect_win_indexed_rows
+ * ----------------------------------------
+ * 기능: WHERE game_win_count = ? 조건을 secondary B+ 트리로 exact lookup 한다.
+ *
+ * 개념:
+ *   - 같은 승리 횟수를 가진 row가 여러 개일 수 있다.
+ *   - B+ 트리 key는 unique이고, value OffsetList가 중복 row index를 담는다.
+ */
+static int executor_collect_win_indexed_rows(const SelectStatement *stmt,
+                                             const TableData *table,
+                                             PlayerIndexSet *indexes,
+                                             const int *selected_indices,
+    int selected_count,
+    char ****out_rows,
+    int *out_row_count) {
+    long long win_count;
+    int *row_indexes;
+    char ***result_rows;
+    int i;
+    int row_index_count;
+
+    if (stmt == NULL || table == NULL || indexes == NULL ||
+        out_rows == NULL || out_row_count == NULL) {
+        return FAILURE;
+    }
+
+    if (!utils_is_integer(stmt->where.value)) {
+        *out_rows = NULL;
+        *out_row_count = 0;
+        return SUCCESS;
+    }
+
+    win_count = utils_parse_integer(stmt->where.value);
+    row_indexes = NULL;
+    row_index_count = 0;
+    if (index_collect_win_count_row_indexes(indexes, stmt->where.op, win_count,
+                                            &row_indexes,
+                                            &row_index_count) != SUCCESS) {
+        return FAILURE;
+    }
+
+    if (row_index_count == 0) {
+        *out_rows = NULL;
+        *out_row_count = 0;
+        return SUCCESS;
+    }
+
+    if (executor_allocate_result_rows(&result_rows, row_index_count) != SUCCESS) {
+        free(row_indexes);
+        return FAILURE;
+    }
+
+    for (i = 0; i < row_index_count; i++) {
+        if (row_indexes[i] < 0 || row_indexes[i] >= table->row_count) {
+            executor_free_result_rows(result_rows, i, selected_count);
+            free(row_indexes);
+            return FAILURE;
+        }
+
+        if (executor_copy_projected_row(result_rows, i, table->rows[row_indexes[i]],
+                                        selected_indices, selected_count) != SUCCESS) {
+            executor_free_result_rows(result_rows, i, selected_count);
+            free(row_indexes);
+            return FAILURE;
+        }
+    }
+
+    free(row_indexes);
+    *out_rows = result_rows;
+    *out_row_count = row_index_count;
     return SUCCESS;
 }
 
@@ -575,27 +772,101 @@ static int executor_execute_insert(const InsertStatement *stmt) {
     }
 
     executor_invalidate_table_cache(stmt->table_name);
-    printf("1 row inserted into %s.\n", stmt->table_name);
+    if (!executor_silent_output) {
+        printf("[성공] %s 테이블에 1행을 삽입했습니다.\n", stmt->table_name);
+    }
     return SUCCESS;
 }
 
+static int executor_table_supports_player_indexes(const TableData *table) {
+    return executor_find_column_index(table->columns, table->col_count, "id") != FAILURE &&
+           executor_find_column_index(table->columns, table->col_count,
+                                      "game_win_count") != FAILURE;
+}
+
+static ExecPlan executor_choose_select_plan(const SelectStatement *stmt,
+                                            const TableData *table,
+                                            ExecMode mode) {
+    int supports_player_indexes;
+
+    if (stmt == NULL || table == NULL || !stmt->has_where) {
+        return EXEC_PLAN_FULL_SCAN;
+    }
+
+    supports_player_indexes = executor_table_supports_player_indexes(table);
+    if (mode == EXEC_MODE_FORCE_LINEAR || !supports_player_indexes) {
+        return EXEC_PLAN_LINEAR_SCAN;
+    }
+
+    if (mode == EXEC_MODE_FORCE_ID_INDEX) {
+        if (strcmp(stmt->where.op, "=") == 0 &&
+            utils_equals_ignore_case(stmt->where.column, "id")) {
+            return EXEC_PLAN_BPTREE_ID_LOOKUP;
+        }
+        return EXEC_PLAN_LINEAR_SCAN;
+    }
+
+    if (mode == EXEC_MODE_FORCE_WIN_INDEX) {
+        if (utils_equals_ignore_case(stmt->where.column, "game_win_count")) {
+            return EXEC_PLAN_BPTREE_WIN_LOOKUP;
+        }
+        return EXEC_PLAN_LINEAR_SCAN;
+    }
+
+    /*
+     * 일반 SQL 실행에서는 id exact match와 game_win_count 조건을 B+ 트리로 보낸다.
+     * 다른 컬럼은 의도적으로 선형 탐색을 사용해 스펙의 비교 기준을 명확히 한다.
+     */
+    if (strcmp(stmt->where.op, "=") == 0 &&
+        utils_equals_ignore_case(stmt->where.column, "id")) {
+        return EXEC_PLAN_BPTREE_ID_LOOKUP;
+    }
+    if (utils_equals_ignore_case(stmt->where.column, "game_win_count")) {
+        return EXEC_PLAN_BPTREE_WIN_LOOKUP;
+    }
+
+    return EXEC_PLAN_LINEAR_SCAN;
+}
+
 /*
- * SELECT 문 하나를 실행하고 표 형태로 출력한 뒤 결과 메모리를 정리한다.
- * 같은 실행 안에서는 테이블과 컬럼 인덱스를 재사용한다.
+ * 함수명: executor_execute_select_with_mode
+ * ----------------------------------------
+ * 기능: SELECT를 실행하되 benchmark용 mode/silent/stats를 지원한다.
+ *
+ * 핵심 흐름:
+ *   1. projection을 준비한다.
+ *   2. 실행 계획을 고른다: full scan, linear scan, id B+ tree, win B+ tree.
+ *   3. 결과 row를 모으고, silent가 아니면 표를 출력한다.
+ *
+ * 개념:
+ *   - SQL 문법은 그대로 유지하고 mode 플래그만 바꿔 공정한 benchmark를 만든다.
+ *   - print I/O는 benchmark 시간 왜곡이 크기 때문에 silent 모드에서 제거한다.
  */
-static int executor_execute_select(const SelectStatement *stmt) {
+int executor_execute_select_with_mode(const SelectStatement *stmt, ExecMode mode,
+                                      int silent, ExecStats *stats) {
     const TableData *table;
-    TableIndex *index;
+    PlayerIndexSet *indexes;
     int selected_indices[MAX_COLUMNS];
     char headers[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
     int selected_count;
     char ***result_rows;
     int result_row_count;
     int status;
+    ExecPlan plan;
+    long scanned_rows;
+    double start_ms;
+    double elapsed_ms;
 
     if (stmt == NULL) {
         return FAILURE;
     }
+
+    if (stats != NULL) {
+        memset(stats, 0, sizeof(*stats));
+        stats->plan_used = EXEC_PLAN_NONE;
+    }
+
+    start_ms = executor_now_ms();
 
     if (executor_get_cached_table(stmt->table_name, &table) != SUCCESS) {
         return FAILURE;
@@ -609,30 +880,77 @@ static int executor_execute_select(const SelectStatement *stmt) {
 
     result_rows = NULL;
     result_row_count = 0;
-    if (!stmt->has_where) {
+    scanned_rows = 0;
+    plan = executor_choose_select_plan(stmt, table, mode);
+
+    if (plan == EXEC_PLAN_FULL_SCAN) {
         status = executor_collect_all_rows(table, selected_indices, selected_count,
                                            &result_rows, &result_row_count);
+        scanned_rows = table->row_count;
+    } else if (plan == EXEC_PLAN_LINEAR_SCAN) {
+        status = executor_collect_linear_rows(stmt, table, selected_indices,
+                                              selected_count, &result_rows,
+                                              &result_row_count, &scanned_rows);
     } else {
-        if (executor_get_cached_index(stmt->table_name, stmt->where.column,
-                                      table, &index) != SUCCESS) {
+        if (executor_get_cached_player_indexes(stmt->table_name, table,
+                                               &indexes) != SUCCESS) {
             return FAILURE;
         }
 
-        status = executor_collect_indexed_rows(stmt, table, index,
-                                               selected_indices, selected_count,
-                                               &result_rows, &result_row_count);
+        if (plan == EXEC_PLAN_BPTREE_ID_LOOKUP) {
+            status = executor_collect_id_indexed_rows(stmt, table, indexes,
+                                                      selected_indices,
+                                                      selected_count,
+                                                      &result_rows,
+                                                      &result_row_count);
+            scanned_rows = result_row_count > 0 ? 1 : 0;
+        } else {
+            status = executor_collect_win_indexed_rows(stmt, table, indexes,
+                                                       selected_indices,
+                                                       selected_count,
+                                                       &result_rows,
+                                                       &result_row_count);
+            scanned_rows = result_row_count;
+        }
     }
 
     if (status != SUCCESS) {
         return FAILURE;
     }
 
-    executor_print_table(headers, selected_count, result_rows, result_row_count);
-    printf("%d row%s selected.\n", result_row_count,
-           result_row_count == 1 ? "" : "s");
+    elapsed_ms = executor_now_ms() - start_ms;
+    if (stats != NULL) {
+        stats->plan_used = plan;
+        stats->matched_rows = result_row_count;
+        stats->scanned_rows = scanned_rows;
+        stats->elapsed_ms = elapsed_ms;
+    }
+
+    if (!silent) {
+        printf("\n[실행 계획] %s\n", executor_plan_name(plan));
+        printf("       %s\n", executor_plan_description(plan));
+        printf("       결과 행=%d, 검사 행=%ld, 소요 시간=%.3f ms\n\n",
+               result_row_count, scanned_rows, elapsed_ms);
+        if (executor_summary_only) {
+            printf("[요약] 결과 표 출력은 생략했습니다. 총 %d행을 조회했습니다.\n",
+                   result_row_count);
+        } else {
+            executor_print_table(headers, selected_count, result_rows, result_row_count);
+            printf("%d행을 조회했습니다.\n", result_row_count);
+        }
+    }
 
     executor_free_result_rows(result_rows, result_row_count, selected_count);
     return SUCCESS;
+}
+
+/*
+ * SELECT 문 하나를 실행하고 표 형태로 출력한 뒤 결과 메모리를 정리한다.
+ * 같은 실행 안에서는 테이블과 players 전용 B+ 트리 인덱스를 재사용한다.
+ */
+static int executor_execute_select(const SelectStatement *stmt) {
+    return executor_execute_select_with_mode(stmt, executor_default_mode,
+                                             executor_silent_output, NULL);
 }
 
 /*
@@ -652,8 +970,10 @@ static int executor_execute_delete(const DeleteStatement *stmt) {
     }
 
     executor_invalidate_table_cache(stmt->table_name);
-    printf("%d row%s deleted from %s.\n", deleted_count,
-           deleted_count == 1 ? "" : "s", stmt->table_name);
+    if (!executor_silent_output) {
+        printf("[성공] %s 테이블에서 %d행을 삭제했습니다.\n",
+               stmt->table_name, deleted_count);
+    }
     return SUCCESS;
 }
 

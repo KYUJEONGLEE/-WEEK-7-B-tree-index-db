@@ -12,8 +12,10 @@
  * 문자열에서 연속된 공백을 건너뛰고 다음 유효 위치를 찾는다.
  * 반환값은 SQL 문이 시작될 수 있는 다음 인덱스다.
  */
-static size_t main_skip_whitespace(const char *text, size_t index) {
-    while (text[index] != '\0' && isspace((unsigned char)text[index])) {
+static size_t main_skip_whitespace(const char *text, size_t index)
+{
+    while (text[index] != '\0' && isspace((unsigned char)text[index]))
+    {
         index++;
     }
     return index;
@@ -23,37 +25,43 @@ static size_t main_skip_whitespace(const char *text, size_t index) {
  * 완전한 SQL 문 하나를 파싱하고 실행한다.
  * 빈 문장이거나 정상 실행되면 SUCCESS를 반환한다.
  */
-static int main_process_sql_statement(const char *sql) {
+static int main_process_sql_statement(const char *sql)
+{
     Token *tokens;
     int token_count;
     SqlStatement statement;
     char *working_sql;
     int status;
 
-    if (sql == NULL) {
+    if (sql == NULL)
+    {
         return FAILURE;
     }
 
     working_sql = utils_strdup(sql);
-    if (working_sql == NULL) {
+    if (working_sql == NULL)
+    {
         return FAILURE;
     }
 
     utils_trim(working_sql);
-    if (working_sql[0] == '\0') {
+    if (working_sql[0] == '\0')
+    {
         free(working_sql);
         return SUCCESS;
     }
 
     tokens = tokenizer_tokenize(working_sql, &token_count);
-    if (tokens == NULL || token_count == 0) {
+    if (tokens == NULL || token_count == 0)
+    {
         free(tokens);
         free(working_sql);
         return FAILURE;
     }
 
     status = parser_parse(tokens, token_count, &statement);
-    if (status == SUCCESS) {
+    if (status == SUCCESS)
+    {
         status = executor_execute(&statement);
     }
 
@@ -66,7 +74,8 @@ static int main_process_sql_statement(const char *sql) {
  * `.sql` 파일을 읽어 세미콜론 기준으로 문장을 나눈 뒤 순서대로 실행한다.
  * 파일 읽기나 내부 메모리 할당에 실패하지 않으면 SUCCESS를 반환한다.
  */
-static int main_run_file_mode(const char *path) {
+static int main_run_file_mode(const char *path)
+{
     char *content;
     size_t start;
     int terminator_index;
@@ -74,26 +83,32 @@ static int main_run_file_mode(const char *path) {
     char *remaining;
 
     content = utils_read_file(path);
-    if (content == NULL) {
+    if (content == NULL)
+    {
         return FAILURE;
     }
 
     start = 0;
-    while (content[start] != '\0') {
+    while (content[start] != '\0')
+    {
         start = main_skip_whitespace(content, start);
-        if (content[start] == '\0') {
+        if (content[start] == '\0')
+        {
             break;
         }
 
         terminator_index = utils_find_statement_terminator(content, start);
-        if (terminator_index == FAILURE) {
+        if (terminator_index == FAILURE)
+        {
             remaining = utils_strdup(content + start);
-            if (remaining == NULL) {
+            if (remaining == NULL)
+            {
                 free(content);
                 return FAILURE;
             }
             utils_trim(remaining);
-            if (remaining[0] != '\0') {
+            if (remaining[0] != '\0')
+            {
                 fprintf(stderr, "Error: Missing semicolon at end of SQL statement.\n");
             }
             free(remaining);
@@ -102,7 +117,8 @@ static int main_run_file_mode(const char *path) {
 
         statement = utils_substring(content, start,
                                     (size_t)terminator_index - start + 1);
-        if (statement == NULL) {
+        if (statement == NULL)
+        {
             free(content);
             return FAILURE;
         }
@@ -120,12 +136,14 @@ static int main_run_file_mode(const char *path) {
  * 한 줄 입력을 공백 제거 후 제어 키워드와 비교한다.
  * 일치하면 1, 아니면 0을 반환한다.
  */
-static int main_trimmed_equals(const char *line, const char *keyword) {
+static int main_trimmed_equals(const char *line, const char *keyword)
+{
     char *copy;
     int result;
 
     copy = utils_strdup(line);
-    if (copy == NULL) {
+    if (copy == NULL)
+    {
         return 0;
     }
 
@@ -140,16 +158,19 @@ static int main_trimmed_equals(const char *line, const char *keyword) {
  * 성공 시 갱신된 버퍼 소유권은 계속 호출자에게 있다.
  */
 static int main_replace_buffer_with_remainder(char **buffer, size_t *length,
-                                              size_t *capacity, int end_index) {
+                                              size_t *capacity, int end_index)
+{
     char *remainder;
     size_t remainder_length;
 
-    if (buffer == NULL || *buffer == NULL || length == NULL || capacity == NULL) {
+    if (buffer == NULL || *buffer == NULL || length == NULL || capacity == NULL)
+    {
         return FAILURE;
     }
 
     remainder = utils_strdup(*buffer + end_index + 1);
-    if (remainder == NULL) {
+    if (remainder == NULL)
+    {
         return FAILURE;
     }
 
@@ -166,7 +187,8 @@ static int main_replace_buffer_with_remainder(char **buffer, size_t *length,
  * 사용자가 종료하거나 EOF가 올 때까지 대화형 SQL 셸을 실행한다.
  * 정상 종료면 SUCCESS, 메모리 할당 실패면 FAILURE를 반환한다.
  */
-static int main_run_repl_mode(void) {
+static int main_run_repl_mode(void)
+{
     char line[MAX_SQL_LENGTH];
     char *buffer;
     size_t buffer_length;
@@ -178,31 +200,38 @@ static int main_run_repl_mode(void) {
     buffer_length = 0;
     buffer_capacity = 0;
 
-    while (1) {
+    while (1)
+    {
         printf("%s", buffer_length == 0 ? "SQL> " : "...> ");
         fflush(stdout);
 
-        if (fgets(line, sizeof(line), stdin) == NULL) {
-            if (buffer != NULL && buffer[0] != '\0') {
+        if (fgets(line, sizeof(line), stdin) == NULL)
+        {
+            if (buffer != NULL && buffer[0] != '\0')
+            {
                 fprintf(stderr, "Error: Incomplete SQL statement before EOF.\n");
             }
             break;
         }
 
         if (buffer_length == 0 &&
-            (main_trimmed_equals(line, "exit") || main_trimmed_equals(line, "quit"))) {
+            (main_trimmed_equals(line, "exit") || main_trimmed_equals(line, "quit")))
+        {
             break;
         }
 
-        if (utils_append_buffer(&buffer, &buffer_length, &buffer_capacity, line) != SUCCESS) {
+        if (utils_append_buffer(&buffer, &buffer_length, &buffer_capacity, line) != SUCCESS)
+        {
             free(buffer);
             return FAILURE;
         }
 
         while (buffer != NULL &&
-               (terminator_index = utils_find_statement_terminator(buffer, 0)) != FAILURE) {
+               (terminator_index = utils_find_statement_terminator(buffer, 0)) != FAILURE)
+        {
             statement = utils_substring(buffer, 0, (size_t)terminator_index + 1);
-            if (statement == NULL) {
+            if (statement == NULL)
+            {
                 free(buffer);
                 return FAILURE;
             }
@@ -212,12 +241,14 @@ static int main_run_repl_mode(void) {
 
             if (main_replace_buffer_with_remainder(&buffer, &buffer_length,
                                                    &buffer_capacity,
-                                                   terminator_index) != SUCCESS) {
+                                                   terminator_index) != SUCCESS)
+            {
                 free(buffer);
                 return FAILURE;
             }
 
-            if (buffer_length == 0) {
+            if (buffer_length == 0)
+            {
                 free(buffer);
                 buffer = NULL;
                 buffer_capacity = 0;
@@ -235,17 +266,65 @@ static int main_run_repl_mode(void) {
  * argv에 따라 파일 모드 또는 REPL 모드를 선택하고 종료 전에 파서 캐시를 정리한다.
  * 정상 종료면 EXIT_SUCCESS, 아니면 EXIT_FAILURE를 반환한다.
  */
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
     int status;
+    const char *sql_file;
+    int silent;
+    int summary_only;
+    ExecMode mode;
+    int i;
 
-    if (argc > 2) {
-        fprintf(stderr, "Usage: %s [sql_file]\n", argv[0]);
-        return EXIT_FAILURE;
+    sql_file = NULL;
+    silent = 0;
+    summary_only = 0;
+    mode = EXEC_MODE_NORMAL;
+
+    for (i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--silent") == 0)
+        {
+            silent = 1;
+        }
+        else if (strcmp(argv[i], "--summary-only") == 0)
+        {
+            summary_only = 1;
+        }
+        else if (strcmp(argv[i], "--force-linear") == 0)
+        {
+            mode = EXEC_MODE_FORCE_LINEAR;
+        }
+        else if (strcmp(argv[i], "--force-id-index") == 0)
+        {
+            mode = EXEC_MODE_FORCE_ID_INDEX;
+        }
+        else if (strcmp(argv[i], "--force-win-index") == 0)
+        {
+            mode = EXEC_MODE_FORCE_WIN_INDEX;
+        }
+        else if (sql_file == NULL)
+        {
+            sql_file = argv[i];
+        }
+        else
+        {
+            fprintf(stderr,
+                    "Usage: %s [--silent] [--summary-only] [--force-linear|--force-id-index|--force-win-index] [sql_file]\n",
+                    argv[0]);
+            return EXIT_FAILURE;
+        }
     }
 
-    if (argc == 2) {
-        status = main_run_file_mode(argv[1]);
-    } else {
+    executor_set_silent(silent);
+    executor_set_summary_only(summary_only);
+    executor_set_mode(mode);
+
+    if (sql_file != NULL)
+    {
+        status = main_run_file_mode(sql_file);
+    }
+    else
+    {
         status = main_run_repl_mode();
     }
 

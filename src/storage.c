@@ -19,6 +19,7 @@ static int storage_load_table_from_fp(FILE *fp, const char *table_name,
                                       TableData *table, int include_offsets);
 static int storage_append_field(char ***fields, int *count, int *capacity,
                                 const char *value);
+static int storage_insert_players(const char *table_name, const InsertStatement *stmt);
 
 /*
  * 문자열 목록 안에 같은 값이 이미 있으면 1, 없으면 0을 반환한다.
@@ -90,6 +91,34 @@ static int storage_build_path(const char *table_name, char *path, size_t path_si
     }
 
     written = snprintf(path, path_size, "data/%s.csv", table_name);
+    if (written < 0 || (size_t)written >= path_size) {
+        return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
+/*
+ * 함수명: storage_build_meta_path
+ * ----------------------------------------
+ * 기능: auto-increment next_id를 저장하는 sidecar meta 파일 경로를 만든다.
+ *
+ * 핵심 흐름:
+ *   - data/<table>.meta 형식으로 CSV와 같은 디렉터리에 둔다.
+ *
+ * 개념:
+ *   - 기존처럼 INSERT마다 CSV 전체를 스캔하면 100만 건 입력에서 병목이 된다.
+ *   - meta 파일에는 다음에 사용할 id 하나만 저장해 O(1)에 가깝게 가져온다.
+ */
+static int storage_build_meta_path(const char *table_name, char *path,
+                                   size_t path_size) {
+    int written;
+
+    if (table_name == NULL || path == NULL || path_size == 0) {
+        return FAILURE;
+    }
+
+    written = snprintf(path, path_size, "data/%s.meta", table_name);
     if (written < 0 || (size_t)written >= path_size) {
         return FAILURE;
     }
@@ -557,6 +586,113 @@ static int storage_get_next_auto_id(FILE *fp, const char *table_name,
     return SUCCESS;
 }
 
+static int storage_read_meta_next_id(const char *table_name, long long *next_id) {
+    FILE *fp;
+    char path[MAX_PATH_LEN];
+
+    if (table_name == NULL || next_id == NULL) {
+        return FAILURE;
+    }
+
+    if (storage_build_meta_path(table_name, path, sizeof(path)) != SUCCESS) {
+        fprintf(stderr, "Error: Meta path is too long.\n");
+        return FAILURE;
+    }
+
+    fp = fopen(path, "r");
+    if (fp == NULL) {
+        return FAILURE;
+    }
+
+    if (fscanf(fp, "%lld", next_id) != 1 || *next_id <= 0) {
+        fclose(fp);
+        return FAILURE;
+    }
+
+    fclose(fp);
+    return SUCCESS;
+}
+
+static int storage_write_meta_next_id(const char *table_name, long long next_id) {
+    FILE *fp;
+    char path[MAX_PATH_LEN];
+
+    if (table_name == NULL || next_id <= 0) {
+        return FAILURE;
+    }
+
+    if (storage_build_meta_path(table_name, path, sizeof(path)) != SUCCESS) {
+        fprintf(stderr, "Error: Meta path is too long.\n");
+        return FAILURE;
+    }
+
+    fp = fopen(path, "w");
+    if (fp == NULL) {
+        fprintf(stderr, "Error: Failed to write meta file for '%s'.\n", table_name);
+        return FAILURE;
+    }
+
+    fprintf(fp, "%lld\n", next_id);
+    fclose(fp);
+    return SUCCESS;
+}
+
+static int storage_bump_meta_next_id(const char *table_name, long long used_id) {
+    long long current_next;
+    long long desired_next;
+
+    if (table_name == NULL || used_id <= 0) {
+        return FAILURE;
+    }
+
+    desired_next = used_id + 1;
+    if (storage_read_meta_next_id(table_name, &current_next) == SUCCESS &&
+        current_next > desired_next) {
+        desired_next = current_next;
+    }
+
+    return storage_write_meta_next_id(table_name, desired_next);
+}
+
+/*
+ * 함수명: storage_get_meta_next_auto_id
+ * ----------------------------------------
+ * 기능: meta 파일에서 next_id를 읽고, 없으면 CSV를 한 번만 스캔해 복구한다.
+ *
+ * 핵심 흐름:
+ *   1. data/<table>.meta를 읽는다.
+ *   2. meta가 없으면 현재 CSV에서 max(id)+1을 계산한다.
+ *   3. 복구한 next_id를 meta에 저장해 다음 INSERT부터 full scan을 피한다.
+ *
+ * 개념:
+ *   - 대량 INSERT의 병목은 "다음 id 계산을 위한 반복 full scan"이다.
+ *   - meta 파일은 이 병목을 제거하는 단순한 sidecar 저장소다.
+ */
+static int storage_get_meta_next_auto_id(FILE *fp, const char *table_name,
+                                         const char columns[][MAX_IDENTIFIER_LEN],
+                                         int col_count, char *buffer,
+                                         size_t buffer_size) {
+    long long next_id;
+
+    if (storage_read_meta_next_id(table_name, &next_id) != SUCCESS) {
+        if (storage_get_next_auto_id(fp, table_name, columns, col_count,
+                                     buffer, buffer_size) != SUCCESS) {
+            return FAILURE;
+        }
+
+        next_id = utils_parse_integer(buffer);
+        if (storage_write_meta_next_id(table_name, next_id) != SUCCESS) {
+            return FAILURE;
+        }
+    }
+
+    if (snprintf(buffer, buffer_size, "%lld", next_id) < 0) {
+        return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
 /*
  * 필요하면 따옴표와 이스케이프를 추가해 CSV 셀 하나를 기록한다.
  */
@@ -1004,6 +1140,197 @@ int storage_delete(const char *table_name, const DeleteStatement *stmt,
     return SUCCESS;
 }
 
+static int storage_find_statement_column(const InsertStatement *stmt,
+                                         const char *column_name) {
+    int i;
+
+    if (stmt == NULL || column_name == NULL) {
+        return FAILURE;
+    }
+
+    for (i = 0; i < stmt->column_count; i++) {
+        if (utils_equals_ignore_case(stmt->columns[i], column_name)) {
+            return i;
+        }
+    }
+
+    return FAILURE;
+}
+
+static int storage_validate_players_header(
+        const char columns[][MAX_IDENTIFIER_LEN], int col_count) {
+    static const char *expected[] = {
+        "id", "nickname", "game_win_count", "game_loss_count",
+        "total_game_count"
+    };
+    int i;
+
+    if (col_count != 5) {
+        return FAILURE;
+    }
+
+    for (i = 0; i < 5; i++) {
+        if (!utils_equals_ignore_case(columns[i], expected[i])) {
+            return FAILURE;
+        }
+    }
+
+    return SUCCESS;
+}
+
+/*
+ * 함수명: storage_insert_players
+ * ----------------------------------------
+ * 기능: players 전용 고정 스키마 INSERT를 처리한다.
+ *
+ * 핵심 흐름:
+ *   1. id는 meta 파일의 next_id로 자동 부여한다.
+ *   2. 입력에서 nickname, game_win_count, game_loss_count를 읽는다.
+ *   3. total_game_count는 wins + losses로 내부 계산해 저장한다.
+ *   4. 성공 후 meta 파일을 next_id + 1로 갱신한다.
+ *
+ * 개념:
+ *   - benchmark에서 100만 건 INSERT를 빠르게 처리하려면 id 계산이 O(1)에 가까워야 한다.
+ *   - players 테이블은 과제용 고정 스키마라 일반 테이블보다 더 명확하게 처리한다.
+ */
+static int storage_insert_players(const char *table_name, const InsertStatement *stmt) {
+    static const char *headers[] = {
+        "id", "nickname", "game_win_count", "game_loss_count",
+        "total_game_count"
+    };
+    FILE *fp;
+    char path[MAX_PATH_LEN];
+    char existing_columns[MAX_COLUMNS][MAX_IDENTIFIER_LEN];
+    int existing_count;
+    int nickname_index;
+    int win_index;
+    int loss_index;
+    long long id;
+    long long wins;
+    long long losses;
+    long long total;
+    char id_value[MAX_VALUE_LEN];
+    char win_value[MAX_VALUE_LEN];
+    char loss_value[MAX_VALUE_LEN];
+    char total_value[MAX_VALUE_LEN];
+    const char *ordered_values[5];
+
+    if (table_name == NULL || stmt == NULL) {
+        return FAILURE;
+    }
+
+    nickname_index = storage_find_statement_column(stmt, "nickname");
+    win_index = storage_find_statement_column(stmt, "game_win_count");
+    loss_index = storage_find_statement_column(stmt, "game_loss_count");
+    if (nickname_index == FAILURE || win_index == FAILURE ||
+        loss_index == FAILURE) {
+        fprintf(stderr,
+                "Error: players INSERT requires nickname, game_win_count, and game_loss_count.\n");
+        return FAILURE;
+    }
+
+    if (!utils_is_integer(stmt->values[win_index]) ||
+        !utils_is_integer(stmt->values[loss_index])) {
+        fprintf(stderr, "Error: game counts must be integer values.\n");
+        return FAILURE;
+    }
+
+    wins = utils_parse_integer(stmt->values[win_index]);
+    losses = utils_parse_integer(stmt->values[loss_index]);
+    total = wins + losses;
+
+    if (storage_ensure_data_dir() != SUCCESS ||
+        storage_build_path(table_name, path, sizeof(path)) != SUCCESS) {
+        return FAILURE;
+    }
+
+    fp = fopen(path, "a+");
+    if (fp == NULL) {
+        fprintf(stderr, "Error: Failed to open table '%s'.\n", table_name);
+        return FAILURE;
+    }
+
+    if (storage_lock_file(fp, LOCK_EX) != SUCCESS) {
+        fclose(fp);
+        return FAILURE;
+    }
+
+    rewind(fp);
+    if (storage_read_header(fp, existing_columns, &existing_count) != SUCCESS) {
+        flock(fileno(fp), LOCK_UN);
+        fclose(fp);
+        return FAILURE;
+    }
+
+    if (existing_count == 0) {
+        if (utils_safe_strcpy(id_value, sizeof(id_value), "1") != SUCCESS) {
+            flock(fileno(fp), LOCK_UN);
+            fclose(fp);
+            return FAILURE;
+        }
+        id = 1;
+    } else {
+        if (storage_validate_players_header(existing_columns, existing_count) != SUCCESS) {
+            fprintf(stderr, "Error: players table schema is invalid.\n");
+            flock(fileno(fp), LOCK_UN);
+            fclose(fp);
+            return FAILURE;
+        }
+
+        if (storage_get_meta_next_auto_id(fp, table_name, existing_columns,
+                                          existing_count, id_value,
+                                          sizeof(id_value)) != SUCCESS) {
+            flock(fileno(fp), LOCK_UN);
+            fclose(fp);
+            return FAILURE;
+        }
+        id = utils_parse_integer(id_value);
+    }
+
+    snprintf(win_value, sizeof(win_value), "%lld", wins);
+    snprintf(loss_value, sizeof(loss_value), "%lld", losses);
+    snprintf(total_value, sizeof(total_value), "%lld", total);
+
+    ordered_values[0] = id_value;
+    ordered_values[1] = stmt->values[nickname_index];
+    ordered_values[2] = win_value;
+    ordered_values[3] = loss_value;
+    ordered_values[4] = total_value;
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fprintf(stderr, "Error: Failed to append to table '%s'.\n", table_name);
+        flock(fileno(fp), LOCK_UN);
+        fclose(fp);
+        return FAILURE;
+    }
+
+    if (existing_count == 0 &&
+        storage_write_csv_row(fp, headers, 5) != SUCCESS) {
+        fprintf(stderr, "Error: Failed to write players header.\n");
+        flock(fileno(fp), LOCK_UN);
+        fclose(fp);
+        return FAILURE;
+    }
+
+    if (storage_write_csv_row(fp, ordered_values, 5) != SUCCESS) {
+        fprintf(stderr, "Error: Failed to write table '%s'.\n", table_name);
+        flock(fileno(fp), LOCK_UN);
+        fclose(fp);
+        return FAILURE;
+    }
+
+    if (storage_bump_meta_next_id(table_name, id) != SUCCESS) {
+        flock(fileno(fp), LOCK_UN);
+        fclose(fp);
+        return FAILURE;
+    }
+
+    fflush(fp);
+    flock(fileno(fp), LOCK_UN);
+    fclose(fp);
+    return SUCCESS;
+}
+
 /*
  * 행 하나를 테이블에 삽입한다.
  * 필요하면 CSV 파일과 스키마를 만들고 auto-increment id와 기본 키 검사를 처리한다.
@@ -1023,9 +1350,15 @@ int storage_insert(const char *table_name, const InsertStatement *stmt) {
     const char *header_values[MAX_COLUMNS];
     char auto_id_value[MAX_VALUE_LEN];
     long file_end;
+    int should_update_meta;
+    long long used_id;
 
     if (table_name == NULL || stmt == NULL) {
         return FAILURE;
+    }
+
+    if (utils_equals_ignore_case(table_name, "players")) {
+        return storage_insert_players(table_name, stmt);
     }
 
     if (storage_ensure_data_dir() != SUCCESS) {
@@ -1047,6 +1380,9 @@ int storage_insert(const char *table_name, const InsertStatement *stmt) {
         fclose(fp);
         return FAILURE;
     }
+
+    should_update_meta = 0;
+    used_id = 0;
 
     rewind(fp);
     if (storage_read_header(fp, existing_columns, &existing_count) != SUCCESS) {
@@ -1079,6 +1415,8 @@ int storage_insert(const char *table_name, const InsertStatement *stmt) {
 
             header_values[0] = final_columns[0];
             ordered_values[0] = auto_id_value;
+            should_update_meta = 1;
+            used_id = 1;
             final_count = stmt->column_count + 1;
 
             for (i = 0; i < stmt->column_count; i++) {
@@ -1103,6 +1441,11 @@ int storage_insert(const char *table_name, const InsertStatement *stmt) {
                 }
                 header_values[i] = final_columns[i];
                 ordered_values[i] = stmt->values[i];
+            }
+            if (stmt_id_index != FAILURE &&
+                utils_is_integer(ordered_values[stmt_id_index])) {
+                should_update_meta = 1;
+                used_id = utils_parse_integer(ordered_values[stmt_id_index]);
             }
         }
 
@@ -1156,13 +1499,15 @@ int storage_insert(const char *table_name, const InsertStatement *stmt) {
         }
 
         if (existing_id_index != FAILURE && stmt_id_index == FAILURE) {
-            if (storage_get_next_auto_id(fp, table_name, existing_columns,
-                                         existing_count, auto_id_value,
-                                         sizeof(auto_id_value)) != SUCCESS) {
+            if (storage_get_meta_next_auto_id(fp, table_name, existing_columns,
+                                              existing_count, auto_id_value,
+                                              sizeof(auto_id_value)) != SUCCESS) {
                 flock(fileno(fp), LOCK_UN);
                 fclose(fp);
                 return FAILURE;
             }
+            should_update_meta = 1;
+            used_id = utils_parse_integer(auto_id_value);
         }
 
         for (i = 0; i < existing_count; i++) {
@@ -1175,6 +1520,12 @@ int storage_insert(const char *table_name, const InsertStatement *stmt) {
                 (const char (*)[MAX_IDENTIFIER_LEN])stmt->columns,
                 stmt->column_count, existing_columns[i]);
             ordered_values[i] = stmt->values[match_index];
+        }
+
+        if (existing_id_index != FAILURE && stmt_id_index != FAILURE &&
+            utils_is_integer(ordered_values[existing_id_index])) {
+            should_update_meta = 1;
+            used_id = utils_parse_integer(ordered_values[existing_id_index]);
         }
 
         if (!(existing_id_index != FAILURE && stmt_id_index == FAILURE)) {
@@ -1207,6 +1558,13 @@ int storage_insert(const char *table_name, const InsertStatement *stmt) {
             fclose(fp);
             return FAILURE;
         }
+    }
+
+    if (should_update_meta &&
+        storage_bump_meta_next_id(table_name, used_id) != SUCCESS) {
+        flock(fileno(fp), LOCK_UN);
+        fclose(fp);
+        return FAILURE;
     }
 
     fflush(fp);
