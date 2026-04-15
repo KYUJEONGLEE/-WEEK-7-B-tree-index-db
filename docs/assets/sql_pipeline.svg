@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520" role="img" aria-labelledby="title desc">
+  <title id="title">Mini SQL Processor 실행 파이프라인</title>
+  <desc id="desc">SQL 입력이 tokenizer, parser, executor를 거쳐 storage 또는 B+ tree index로 실행되는 흐름</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#374151" />
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 28px Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 400 15px Arial, sans-serif; fill: #4b5563; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 12; }
+      .box-blue { fill: #eef6ff; stroke: #60a5fa; stroke-width: 2; rx: 12; }
+      .box-green { fill: #ecfdf5; stroke: #34d399; stroke-width: 2; rx: 12; }
+      .box-orange { fill: #fff7ed; stroke: #fb923c; stroke-width: 2; rx: 12; }
+      .box-red { fill: #fff1f2; stroke: #fb7185; stroke-width: 2; rx: 12; }
+      .label { font: 700 18px Arial, sans-serif; fill: #111827; }
+      .small { font: 400 13px Arial, sans-serif; fill: #374151; }
+      .mono { font: 600 13px Consolas, monospace; fill: #1f2937; }
+      .arrow { stroke: #374151; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .thin { stroke: #94a3b8; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #64748b; stroke-width: 1.8; stroke-dasharray: 6 5; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1100" height="520" />
+  <text class="title" x="48" y="56">Mini SQL Processor 실행 파이프라인</text>
+  <text class="subtitle" x="48" y="84">SQL 문법은 유지하고, executor 단계에서 조건에 맞는 실행 계획을 선택한다.</text>
+
+  <rect class="box" x="48" y="145" width="150" height="92" />
+  <text class="label" x="84" y="180">SQL 입력</text>
+  <text class="mono" x="68" y="208">SELECT ...</text>
+
+  <rect class="box-blue" x="255" y="145" width="150" height="92" />
+  <text class="label" x="286" y="180">Tokenizer</text>
+  <text class="small" x="281" y="208">토큰 단위 분리</text>
+
+  <rect class="box-blue" x="462" y="145" width="150" height="92" />
+  <text class="label" x="503" y="180">Parser</text>
+  <text class="small" x="491" y="208">SQL 구조체 생성</text>
+
+  <rect class="box-orange" x="669" y="129" width="178" height="124" />
+  <text class="label" x="712" y="165">Executor</text>
+  <text class="small" x="696" y="194">WHERE 조건 분석</text>
+  <text class="small" x="694" y="218">실행 계획 선택</text>
+
+  <rect class="box-green" x="910" y="116" width="142" height="76" />
+  <text class="label" x="940" y="148">Index</text>
+  <text class="small" x="932" y="174">B+ tree 조회</text>
+
+  <rect class="box-red" x="910" y="229" width="142" height="76" />
+  <text class="label" x="934" y="261">Storage</text>
+  <text class="small" x="934" y="287">CSV 읽기/쓰기</text>
+
+  <rect class="box" x="910" y="354" width="142" height="76" />
+  <text class="label" x="943" y="386">Result</text>
+  <text class="small" x="935" y="412">row + 실행 요약</text>
+
+  <path class="arrow" d="M198 191 H255" />
+  <path class="arrow" d="M405 191 H462" />
+  <path class="arrow" d="M612 191 H669" />
+  <path class="arrow" d="M847 166 H910" />
+  <path class="arrow" d="M847 218 C872 218 878 267 910 267" />
+  <path class="arrow" d="M981 192 V229" />
+  <path class="arrow" d="M981 305 V354" />
+
+  <rect class="box" x="255" y="335" width="230" height="98" />
+  <text class="label" x="288" y="370">TableData Cache</text>
+  <text class="small" x="290" y="398">CSV를 메모리 row 배열로 보관</text>
+
+  <rect class="box-green" x="535" y="335" width="260" height="98" />
+  <text class="label" x="572" y="370">PlayerIndex Cache</text>
+  <text class="small" x="575" y="398">id_tree, win_tree 재사용</text>
+
+  <path class="dash" d="M735 253 C705 298 660 303 660 335" />
+  <path class="dash" d="M715 253 C655 302 421 300 382 335" />
+
+  <text class="small" x="48" y="485">핵심: parser 이후 SQL 구조는 같지만, executor가 id/game_win_count 조건을 만나면 선형 탐색 대신 B+ 트리 인덱스를 선택한다.</text>
+</svg>

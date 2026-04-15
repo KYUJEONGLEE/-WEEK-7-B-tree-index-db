@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="560" viewBox="0 0 1100 560" role="img" aria-labelledby="title desc">
+  <title id="title">players 인덱스 매핑 구조</title>
+  <desc id="desc">players CSV가 TableData로 로드되고 id_tree와 win_tree가 row_index를 통해 row 배열에 연결되는 구조</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155" />
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 28px Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 400 15px Arial, sans-serif; fill: #4b5563; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 14; }
+      .table-head { fill: #e0f2fe; stroke: #7dd3fc; stroke-width: 1; }
+      .table-row { fill: #ffffff; stroke: #e2e8f0; stroke-width: 1; }
+      .index { fill: #ecfdf5; stroke: #34d399; stroke-width: 2; rx: 12; }
+      .value { fill: #fff7ed; stroke: #fb923c; stroke-width: 2; rx: 10; }
+      .label { font: 700 18px Arial, sans-serif; fill: #111827; }
+      .small { font: 400 13px Arial, sans-serif; fill: #374151; }
+      .mono { font: 600 13px Consolas, monospace; fill: #1f2937; }
+      .arrow { stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #64748b; stroke-width: 1.8; stroke-dasharray: 6 5; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1100" height="560" />
+  <text class="title" x="48" y="58">players 인덱스 매핑 구조</text>
+  <text class="subtitle" x="48" y="86">B+ 트리의 value는 파일 offset이 아니라 메모리 TableData의 row_index를 가리킨다.</text>
+
+  <rect class="panel" x="48" y="130" width="250" height="310" />
+  <text class="label" x="82" y="166">data/players.csv</text>
+  <rect class="table-head" x="72" y="192" width="202" height="38" />
+  <text class="mono" x="88" y="216">id,nickname,win,...</text>
+  <rect class="table-row" x="72" y="230" width="202" height="36" />
+  <text class="mono" x="90" y="253">1,player_1,120</text>
+  <rect class="table-row" x="72" y="266" width="202" height="36" />
+  <text class="mono" x="90" y="289">2,player_2,150</text>
+  <rect class="table-row" x="72" y="302" width="202" height="36" />
+  <text class="mono" x="90" y="325">3,player_3,150</text>
+  <rect class="table-row" x="72" y="338" width="202" height="36" />
+  <text class="mono" x="90" y="361">4,player_4,90</text>
+  <text class="small" x="78" y="408">storage_load_table()</text>
+
+  <rect class="panel" x="410" y="126" width="290" height="318" />
+  <text class="label" x="452" y="164">TableData rows</text>
+  <rect class="table-head" x="438" y="192" width="232" height="38" />
+  <text class="mono" x="455" y="216">row_index -> row pointer</text>
+  <rect class="table-row" x="438" y="230" width="232" height="38" />
+  <text class="mono" x="456" y="254">0 -> player_1</text>
+  <rect class="table-row" x="438" y="268" width="232" height="38" />
+  <text class="mono" x="456" y="292">1 -> player_2</text>
+  <rect class="table-row" x="438" y="306" width="232" height="38" />
+  <text class="mono" x="456" y="330">2 -> player_3</text>
+  <rect class="table-row" x="438" y="344" width="232" height="38" />
+  <text class="mono" x="456" y="368">3 -> player_4</text>
+  <text class="small" x="436" y="414">executor는 row_index로 rows에 바로 접근</text>
+
+  <rect class="index" x="788" y="126" width="254" height="132" />
+  <text class="label" x="848" y="162">id_tree</text>
+  <text class="mono" x="820" y="194">id 2 -> RowRef(1)</text>
+  <text class="mono" x="820" y="220">id 4 -> RowRef(3)</text>
+
+  <rect class="index" x="788" y="312" width="254" height="132" />
+  <text class="label" x="838" y="348">win_tree</text>
+  <text class="mono" x="816" y="380">win 150 -> [1, 2]</text>
+  <text class="mono" x="816" y="406">win 90  -> [3]</text>
+
+  <rect class="value" x="795" y="472" width="240" height="48" />
+  <text class="small" x="812" y="501">중복 key는 OffsetList에 row_index list 저장</text>
+
+  <path class="arrow" d="M298 285 H410" />
+  <path class="dash" d="M700 246 C745 235 746 205 788 196" />
+  <path class="dash" d="M700 340 C747 351 746 383 788 384" />
+  <path class="arrow" d="M788 194 C742 196 730 268 670 288" />
+  <path class="arrow" d="M788 384 C740 383 729 327 670 325" />
+
+  <text class="small" x="48" y="506">효과: 인덱스 조회 후 CSV를 다시 seek/read하지 않고, 이미 로드된 TableData row를 바로 사용한다.</text>
+</svg>
