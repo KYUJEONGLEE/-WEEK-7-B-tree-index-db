@@ -11,11 +11,23 @@ typedef struct {
     long *offsets;
 } TableData;
 
+typedef struct {
+    long long assigned_id;
+    int game_win_count;
+    int game_loss_count;
+    int total_game_count;
+    long file_offset;
+    int id_was_auto_generated;
+} StorageInsertResult;
+
 /*
  * 테이블 CSV 파일에 행 하나를 추가한다.
  * 성공 시 SUCCESS, 실패 시 FAILURE를 반환한다.
  */
 int storage_insert(const char *table_name, const InsertStatement *stmt);
+
+int storage_insert_with_result(const char *table_name, const InsertStatement *stmt,
+                               StorageInsertResult *result);
 
 /*
  * 테이블 CSV 파일에서 조건에 맞는 행을 삭제한다.

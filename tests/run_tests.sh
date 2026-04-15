@@ -39,7 +39,8 @@ run_sql_test() {
 }
 
 for binary in build/tests/test_tokenizer build/tests/test_parser \
-              build/tests/test_storage build/tests/test_executor
+              build/tests/test_storage build/tests/test_executor \
+              build/tests/test_bptree build/tests/test_index
 do
     run_unit_test "$binary"
 done
@@ -51,6 +52,7 @@ run_sql_test "Edge cases" "tests/test_cases/edge_cases.sql" "Lee, Jr."
 run_sql_test "Duplicate primary key" "tests/test_cases/duplicate_primary_key.sql" "Duplicate primary key value"
 run_sql_test "Delete WHERE" "tests/test_cases/delete_where.sql" "1 row deleted from users."
 run_sql_test "Delete grouped slot" "tests/test_cases/delete_grouped_slot.sql" "5 rows deleted from jungle_menu."
+run_sql_test "Player B+ Tree SELECT" "tests/test_cases/player_bptree.sql" "player_000002"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

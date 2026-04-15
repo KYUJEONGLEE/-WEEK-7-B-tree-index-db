@@ -4,392 +4,345 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * 문자열 키 하나를 해시 값으로 변환해 등호 인덱스 버킷 위치를 정한다.
- */
-static unsigned long index_hash_string(const char *text) {
-    unsigned long hash;
-    size_t i;
+static int index_find_column_index(const char columns[][MAX_IDENTIFIER_LEN],
+                                   int col_count, const char *target) {
+    int i;
 
-    hash = 5381UL;
-    for (i = 0; text[i] != '\0'; i++) {
-        hash = ((hash << 5U) + hash) + (unsigned char)text[i];
+    for (i = 0; i < col_count; i++) {
+        if (utils_equals_ignore_case(columns[i], target)) {
+            return i;
+        }
     }
 
-    return hash;
+    return FAILURE;
+}
+
+static RowRef *index_create_row_ref(long offset) {
+    RowRef *ref;
+
+    ref = (RowRef *)malloc(sizeof(RowRef));
+    if (ref == NULL) {
+        fprintf(stderr, "Error: Failed to allocate row reference.\n");
+        return NULL;
+    }
+
+    ref->offset = offset;
+    return ref;
+}
+
+static OffsetList *index_create_offset_list(void) {
+    OffsetList *list;
+
+    list = (OffsetList *)calloc(1, sizeof(OffsetList));
+    if (list == NULL) {
+        fprintf(stderr, "Error: Failed to allocate offset list.\n");
+        return NULL;
+    }
+
+    return list;
 }
 
 /*
- * 동적 오프셋 목록에 파일 오프셋 하나를 추가한다.
- * list에 저장되면 SUCCESS를 반환한다.
+ * 함수명: index_offset_list_append
+ * ------------------------------------------------------------
+ * 기능:
+ *   game_win_count key에 매핑되는 row offset 목록 뒤에 offset을 추가한다.
+ *
+ * 핵심 흐름:
+ *   1. 새 linked-list node를 만든다.
+ *   2. list가 비어 있으면 head/tail을 모두 새 node로 둔다.
+ *   3. 이미 값이 있으면 tail 뒤에 붙인다.
+ *
+ * 개념:
+ *   game_win_count는 여러 player가 같은 값을 가질 수 있다.
+ *   그래서 B+ 트리에 duplicate key를 넣지 않고, 하나의 key가 OffsetList를 갖는다.
  */
 static int index_offset_list_append(OffsetList *list, long offset) {
-    long *new_items;
+    OffsetNode *node;
 
     if (list == NULL) {
         return FAILURE;
     }
 
-    if (list->items == NULL) {
-        list->capacity = 4;
-        list->items = (long *)malloc((size_t)list->capacity * sizeof(long));
-        if (list->items == NULL) {
-            fprintf(stderr, "Error: Failed to allocate memory.\n");
-            return FAILURE;
-        }
-    } else if (list->count >= list->capacity) {
-        list->capacity *= 2;
-        new_items = (long *)realloc(list->items,
-                                    (size_t)list->capacity * sizeof(long));
-        if (new_items == NULL) {
-            fprintf(stderr, "Error: Failed to allocate memory.\n");
-            return FAILURE;
-        }
-        list->items = new_items;
-    }
-
-    list->items[list->count++] = offset;
-    return SUCCESS;
-}
-
-/*
- * 키와 오프셋 한 쌍을 등호 해시 인덱스에 넣는다.
- */
-static int index_add_hash_entry(EqualityIndex *equality, const char *key,
-                                long offset) {
-    unsigned long bucket_index;
-    HashNode *node;
-
-    if (equality == NULL || key == NULL) {
-        return FAILURE;
-    }
-
-    bucket_index = index_hash_string(key) % (unsigned long)equality->bucket_count;
-    node = equality->buckets[bucket_index];
-    while (node != NULL) {
-        if (strcmp(node->key, key) == 0) {
-            return index_offset_list_append(&node->offsets, offset);
-        }
-        node = node->next;
-    }
-
-    node = (HashNode *)calloc(1, sizeof(HashNode));
+    node = (OffsetNode *)malloc(sizeof(OffsetNode));
     if (node == NULL) {
-        fprintf(stderr, "Error: Failed to allocate memory.\n");
+        fprintf(stderr, "Error: Failed to allocate offset node.\n");
         return FAILURE;
     }
 
-    node->key = utils_strdup(key);
-    if (node->key == NULL) {
-        free(node);
-        return FAILURE;
-    }
+    node->offset = offset;
+    node->next = NULL;
 
-    if (index_offset_list_append(&node->offsets, offset) != SUCCESS) {
-        free(node->key);
-        free(node);
-        return FAILURE;
-    }
-
-    node->next = equality->buckets[bucket_index];
-    equality->buckets[bucket_index] = node;
-    return SUCCESS;
-}
-
-/*
- * 범위 인덱스 엔트리를 값 기준으로 정렬하고, 같으면 원본 오프셋 기준으로 정렬한다.
- */
-static int index_compare_range_entries(const void *lhs, const void *rhs) {
-    const RangeEntry *left = (const RangeEntry *)lhs;
-    const RangeEntry *right = (const RangeEntry *)rhs;
-    int comparison = utils_compare_values(left->key, right->key);
-
-    if (comparison != 0) {
-        return comparison;
-    }
-
-    if (left->offset < right->offset) {
-        return -1;
-    }
-    if (left->offset > right->offset) {
-        return 1;
-    }
-    return 0;
-}
-
-/*
- * 정렬된 범위 엔트리 하나와 조회 값을 비교한다.
- */
-static int index_compare_entry_to_value(const RangeEntry *entry, const char *value) {
-    return utils_compare_values(entry->key, value);
-}
-
-/*
- * key가 value보다 작지 않은 첫 위치를 반환한다.
- */
-static int index_lower_bound(const RangeEntry *entries, int count,
-                             const char *value) {
-    int left;
-    int right;
-    int middle;
-
-    left = 0;
-    right = count;
-    while (left < right) {
-        middle = left + (right - left) / 2;
-        if (index_compare_entry_to_value(&entries[middle], value) < 0) {
-            left = middle + 1;
-        } else {
-            right = middle;
-        }
-    }
-
-    return left;
-}
-
-/*
- * key가 value보다 큰 첫 위치를 반환한다.
- */
-static int index_upper_bound(const RangeEntry *entries, int count,
-                             const char *value) {
-    int left;
-    int right;
-    int middle;
-
-    left = 0;
-    right = count;
-    while (left < right) {
-        middle = left + (right - left) / 2;
-        if (index_compare_entry_to_value(&entries[middle], value) <= 0) {
-            left = middle + 1;
-        } else {
-            right = middle;
-        }
-    }
-
-    return left;
-}
-
-/*
- * 조회 결과용 오프셋 배열을 새 메모리에 복사한다.
- * 반환된 배열은 호출자가 소유한다.
- */
-static int index_copy_offsets(const long *source, int count, long **offsets) {
-    if (count <= 0) {
-        *offsets = NULL;
-        return SUCCESS;
-    }
-
-    *offsets = (long *)malloc((size_t)count * sizeof(long));
-    if (*offsets == NULL) {
-        fprintf(stderr, "Error: Failed to allocate memory.\n");
-        return FAILURE;
-    }
-
-    memcpy(*offsets, source, (size_t)count * sizeof(long));
-    return SUCCESS;
-}
-
-/*
- * 메모리에 올라온 테이블의 한 컬럼에 대해 등호/범위 인덱스를 만든다.
- * 생성된 out_index는 호출자가 index_free()로 해제해야 한다.
- */
-int index_build(const TableData *table, int column_index, TableIndex *out_index) {
-    int i;
-
-    if (table == NULL || out_index == NULL || column_index < 0 ||
-        column_index >= table->col_count) {
-        return FAILURE;
-    }
-
-    memset(out_index, 0, sizeof(*out_index));
-    out_index->column_index = column_index;
-    out_index->equality.bucket_count = HASH_BUCKET_COUNT;
-    out_index->equality.buckets = (HashNode **)calloc(
-        (size_t)out_index->equality.bucket_count, sizeof(HashNode *));
-    if (out_index->equality.buckets == NULL) {
-        fprintf(stderr, "Error: Failed to allocate memory.\n");
-        return FAILURE;
-    }
-
-    if (table->row_count > 0) {
-        out_index->range.entries = (RangeEntry *)malloc(
-            (size_t)table->row_count * sizeof(RangeEntry));
-        if (out_index->range.entries == NULL) {
-            fprintf(stderr, "Error: Failed to allocate memory.\n");
-            index_free(out_index);
-            return FAILURE;
-        }
-    }
-
-    out_index->range.count = table->row_count;
-    for (i = 0; i < table->row_count; i++) {
-        if (index_add_hash_entry(&out_index->equality,
-                                 table->rows[i][column_index],
-                                 table->offsets[i]) != SUCCESS) {
-            index_free(out_index);
-            return FAILURE;
-        }
-
-        if (utils_safe_strcpy(out_index->range.entries[i].key,
-                              sizeof(out_index->range.entries[i].key),
-                              table->rows[i][column_index]) != SUCCESS) {
-            fprintf(stderr, "Error: Indexed value is too long.\n");
-            index_free(out_index);
-            return FAILURE;
-        }
-        out_index->range.entries[i].offset = table->offsets[i];
-    }
-
-    qsort(out_index->range.entries, (size_t)out_index->range.count,
-          sizeof(RangeEntry), index_compare_range_entries);
-    return SUCCESS;
-}
-
-/*
- * 등호 해시 인덱스에서 값 하나를 조회한다.
- * 반환된 오프셋 배열은 호출자가 해제해야 한다.
- */
-int index_query_equals(const TableIndex *index, const char *value,
-                       long **offsets, int *count) {
-    unsigned long bucket_index;
-    HashNode *node;
-
-    if (index == NULL || value == NULL || offsets == NULL || count == NULL ||
-        index->equality.buckets == NULL) {
-        return FAILURE;
-    }
-
-    bucket_index = index_hash_string(value) %
-                   (unsigned long)index->equality.bucket_count;
-    node = index->equality.buckets[bucket_index];
-    while (node != NULL) {
-        if (strcmp(node->key, value) == 0) {
-            *count = node->offsets.count;
-            return index_copy_offsets(node->offsets.items, node->offsets.count,
-                                      offsets);
-        }
-        node = node->next;
-    }
-
-    *count = 0;
-    *offsets = NULL;
-    return SUCCESS;
-}
-
-/*
- * 범위 인덱스로 `!=`, `>`, `>=`, `<`, `<=` 조건을 조회한다.
- * 반환된 오프셋 배열은 호출자가 해제해야 한다.
- */
-int index_query_range(const TableIndex *index, const char *op, const char *value,
-                      long **offsets, int *count) {
-    int start;
-    int end;
-    int i;
-    int result_count;
-    long *result_offsets;
-
-    if (index == NULL || op == NULL || value == NULL || offsets == NULL ||
-        count == NULL) {
-        return FAILURE;
-    }
-
-    *offsets = NULL;
-    *count = 0;
-
-    if (strcmp(op, "!=") == 0) {
-        if (index->range.count == 0) {
-            return SUCCESS;
-        }
-
-        result_offsets = (long *)malloc((size_t)index->range.count * sizeof(long));
-        if (result_offsets == NULL) {
-            fprintf(stderr, "Error: Failed to allocate memory.\n");
-            return FAILURE;
-        }
-
-        result_count = 0;
-        for (i = 0; i < index->range.count; i++) {
-            if (utils_compare_values(index->range.entries[i].key, value) != 0) {
-                result_offsets[result_count++] = index->range.entries[i].offset;
-            }
-        }
-
-        if (result_count == 0) {
-            free(result_offsets);
-            return SUCCESS;
-        }
-
-        *offsets = result_offsets;
-        *count = result_count;
-        return SUCCESS;
-    }
-
-    start = 0;
-    end = index->range.count;
-    if (strcmp(op, ">") == 0) {
-        start = index_upper_bound(index->range.entries, index->range.count, value);
-    } else if (strcmp(op, ">=") == 0) {
-        start = index_lower_bound(index->range.entries, index->range.count, value);
-    } else if (strcmp(op, "<") == 0) {
-        end = index_lower_bound(index->range.entries, index->range.count, value);
-    } else if (strcmp(op, "<=") == 0) {
-        end = index_upper_bound(index->range.entries, index->range.count, value);
+    if (list->tail == NULL) {
+        list->head = node;
+        list->tail = node;
     } else {
-        fprintf(stderr, "Error: Unsupported WHERE operator '%s'.\n", op);
-        return FAILURE;
+        list->tail->next = node;
+        list->tail = node;
     }
 
-    result_count = end - start;
-    if (result_count <= 0) {
-        return SUCCESS;
-    }
-
-    result_offsets = (long *)malloc((size_t)result_count * sizeof(long));
-    if (result_offsets == NULL) {
-        fprintf(stderr, "Error: Failed to allocate memory.\n");
-        return FAILURE;
-    }
-
-    for (i = 0; i < result_count; i++) {
-        result_offsets[i] = index->range.entries[start + i].offset;
-    }
-
-    *offsets = result_offsets;
-    *count = result_count;
+    list->count++;
     return SUCCESS;
 }
 
-/*
- * 생성된 인덱스가 소유한 동적 메모리를 모두 해제한다.
- */
-void index_free(TableIndex *index) {
-    int i;
-    HashNode *node;
-    HashNode *next;
+static void index_free_offset_list(OffsetList *list) {
+    OffsetNode *node;
+    OffsetNode *next;
 
-    if (index == NULL) {
+    if (list == NULL) {
         return;
     }
 
-    if (index->equality.buckets != NULL) {
-        for (i = 0; i < index->equality.bucket_count; i++) {
-            node = index->equality.buckets[i];
-            while (node != NULL) {
-                next = node->next;
-                free(node->key);
-                node->key = NULL;
-                free(node->offsets.items);
-                node->offsets.items = NULL;
-                free(node);
-                node = next;
-            }
-        }
-        free(index->equality.buckets);
-        index->equality.buckets = NULL;
+    node = list->head;
+    while (node != NULL) {
+        next = node->next;
+        free(node);
+        node = next;
     }
 
-    free(index->range.entries);
-    index->range.entries = NULL;
-    index->range.count = 0;
+    free(list);
+}
+
+static int index_insert_id(PlayerIndexSet *indexes, long long id, long offset) {
+    RowRef *ref;
+
+    ref = index_create_row_ref(offset);
+    if (ref == NULL) {
+        return FAILURE;
+    }
+
+    if (bptree_insert(indexes->id_tree, id, ref) != SUCCESS) {
+        free(ref);
+        fprintf(stderr, "Error: Duplicate id '%lld' in player id index.\n", id);
+        return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
+/*
+ * 함수명: index_insert_win_count
+ * ------------------------------------------------------------
+ * 기능:
+ *   game_win_count index에 win_count -> offset 관계를 추가한다.
+ *
+ * 핵심 흐름:
+ *   1. 이미 win_count key가 있으면 기존 OffsetList에 append한다.
+ *   2. key가 없으면 새 OffsetList를 만들고 B+ 트리에 insert한다.
+ *
+ * 개념:
+ *   id는 unique이지만 game_win_count는 secondary index라 중복이 자연스럽다.
+ *   B+ 트리 core는 duplicate key를 허용하지 않으므로 중복 row는 value list로 관리한다.
+ */
+static int index_insert_win_count(PlayerIndexSet *indexes, long long win_count,
+                                  long offset) {
+    OffsetList *list;
+
+    list = (OffsetList *)bptree_search(indexes->win_tree, win_count);
+    if (list != NULL) {
+        return index_offset_list_append(list, offset);
+    }
+
+    list = index_create_offset_list();
+    if (list == NULL) {
+        return FAILURE;
+    }
+
+    if (index_offset_list_append(list, offset) != SUCCESS) {
+        index_free_offset_list(list);
+        return FAILURE;
+    }
+
+    if (bptree_insert(indexes->win_tree, win_count, list) != SUCCESS) {
+        index_free_offset_list(list);
+        return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
+/*
+ * 함수명: index_build_player_indexes
+ * ------------------------------------------------------------
+ * 기능:
+ *   메모리에 로드된 TableData를 순회하여 id와 game_win_count B+ 트리를 만든다.
+ *
+ * 핵심 흐름:
+ *   1. 테이블에서 id, game_win_count 컬럼 위치를 찾는다.
+ *   2. 각 row의 key 값을 정수로 변환한다.
+ *   3. id tree에는 RowRef, win tree에는 OffsetList를 채운다.
+ *
+ * 개념:
+ *   B+ 트리는 row 전체가 아니라 CSV row offset만 저장한다.
+ *   실제 row 읽기는 storage_read_row_at_offset()이 담당한다.
+ */
+int index_build_player_indexes(const TableData *table, PlayerIndexSet *indexes) {
+    int id_index;
+    int win_index;
+    int i;
+    long long id;
+    long long win_count;
+
+    if (table == NULL || indexes == NULL) {
+        return FAILURE;
+    }
+
+    memset(indexes, 0, sizeof(*indexes));
+    id_index = index_find_column_index(table->columns, table->col_count, "id");
+    win_index = index_find_column_index(table->columns, table->col_count,
+                                        "game_win_count");
+
+    if (id_index != FAILURE) {
+        indexes->id_tree = bptree_create(BPTREE_ORDER);
+        if (indexes->id_tree == NULL) {
+            index_free(indexes);
+            return FAILURE;
+        }
+        indexes->has_id_index = 1;
+    }
+
+    if (win_index != FAILURE) {
+        indexes->win_tree = bptree_create(BPTREE_ORDER);
+        if (indexes->win_tree == NULL) {
+            index_free(indexes);
+            return FAILURE;
+        }
+        indexes->has_win_index = 1;
+    }
+
+    if (!indexes->has_id_index && !indexes->has_win_index) {
+        return SUCCESS;
+    }
+
+    for (i = 0; i < table->row_count; i++) {
+        if (table->offsets == NULL) {
+            fprintf(stderr, "Error: Player indexes require row offsets.\n");
+            index_free(indexes);
+            return FAILURE;
+        }
+
+        if (indexes->has_id_index) {
+            if (!utils_is_integer(table->rows[i][id_index])) {
+                fprintf(stderr, "Error: id index requires integer id values.\n");
+                index_free(indexes);
+                return FAILURE;
+            }
+            id = utils_parse_integer(table->rows[i][id_index]);
+            if (index_insert_id(indexes, id, table->offsets[i]) != SUCCESS) {
+                index_free(indexes);
+                return FAILURE;
+            }
+        }
+
+        if (indexes->has_win_index) {
+            if (!utils_is_integer(table->rows[i][win_index])) {
+                fprintf(stderr,
+                        "Error: game_win_count index requires integer values.\n");
+                index_free(indexes);
+                return FAILURE;
+            }
+            win_count = utils_parse_integer(table->rows[i][win_index]);
+            if (index_insert_win_count(indexes, win_count, table->offsets[i]) != SUCCESS) {
+                index_free(indexes);
+                return FAILURE;
+            }
+        }
+    }
+
+    return SUCCESS;
+}
+
+RowRef *index_search_by_id(PlayerIndexSet *indexes, long long id) {
+    if (indexes == NULL || !indexes->has_id_index || indexes->id_tree == NULL) {
+        return NULL;
+    }
+
+    return (RowRef *)bptree_search(indexes->id_tree, id);
+}
+
+OffsetList *index_search_by_win_count(PlayerIndexSet *indexes,
+                                      long long win_count) {
+    if (indexes == NULL || !indexes->has_win_index || indexes->win_tree == NULL) {
+        return NULL;
+    }
+
+    return (OffsetList *)bptree_search(indexes->win_tree, win_count);
+}
+
+/*
+ * 함수명: index_insert_row
+ * ------------------------------------------------------------
+ * 기능:
+ *   INSERT로 새로 생긴 row를 이미 캐시된 player index set에 반영한다.
+ *
+ * 핵심 흐름:
+ *   id tree가 있으면 unique id -> RowRef를 추가한다.
+ *   win tree가 있으면 game_win_count -> OffsetList에 offset을 추가한다.
+ *
+ * 개념:
+ *   캐시가 없을 때는 굳이 즉시 build하지 않고 다음 SELECT에서 lazy build한다.
+ */
+int index_insert_row(PlayerIndexSet *indexes, long long id,
+                     long long win_count, long offset) {
+    if (indexes == NULL) {
+        return FAILURE;
+    }
+
+    if (indexes->has_id_index && indexes->id_tree != NULL) {
+        if (index_insert_id(indexes, id, offset) != SUCCESS) {
+            return FAILURE;
+        }
+    }
+
+    if (indexes->has_win_index && indexes->win_tree != NULL) {
+        if (index_insert_win_count(indexes, win_count, offset) != SUCCESS) {
+            return FAILURE;
+        }
+    }
+
+    return SUCCESS;
+}
+
+static void index_free_tree_values(BPTree *tree, int free_offset_lists) {
+    BPTreeNode *leaf;
+    int i;
+
+    if (tree == NULL || tree->root == NULL) {
+        return;
+    }
+
+    leaf = tree->root;
+    while (leaf->type == BPTREE_INTERNAL) {
+        leaf = leaf->children[0];
+    }
+
+    while (leaf != NULL) {
+        for (i = 0; i < leaf->num_keys; i++) {
+            if (free_offset_lists) {
+                index_free_offset_list((OffsetList *)leaf->values[i]);
+            } else {
+                free(leaf->values[i]);
+            }
+            leaf->values[i] = NULL;
+        }
+        leaf = leaf->next;
+    }
+}
+
+void index_free(PlayerIndexSet *indexes) {
+    if (indexes == NULL) {
+        return;
+    }
+
+    if (indexes->id_tree != NULL) {
+        index_free_tree_values(indexes->id_tree, 0);
+        bptree_destroy(indexes->id_tree);
+    }
+
+    if (indexes->win_tree != NULL) {
+        index_free_tree_values(indexes->win_tree, 1);
+        bptree_destroy(indexes->win_tree);
+    }
+
+    memset(indexes, 0, sizeof(*indexes));
 }
