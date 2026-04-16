@@ -445,6 +445,8 @@ Benchmark가 비교하는 항목:
 - `WHERE nickname = ?` 일반 선형 탐색 참고값
 
 ---
+## 데모 결과
+<img width="1712" height="1046" alt="sql_demo" src="https://github.com/user-attachments/assets/eeff9d9d-1a41-46a8-96af-db36bc7eecfd" />
 
 ## 테스트
 
