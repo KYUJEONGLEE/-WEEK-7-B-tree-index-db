@@ -65,6 +65,49 @@ static void prepare_menu_insert(InsertStatement *stmt, const char *slot_key,
     snprintf(stmt->values[4], sizeof(stmt->values[4]), "%s", dish_name);
 }
 
+static void prepare_players_insert(InsertStatement *stmt, const char *nickname,
+                                   const char *wins, const char *losses) {
+    memset(stmt, 0, sizeof(*stmt));
+    snprintf(stmt->table_name, sizeof(stmt->table_name), "%s", "players");
+    stmt->column_count = 3;
+    snprintf(stmt->columns[0], sizeof(stmt->columns[0]), "nickname");
+    snprintf(stmt->columns[1], sizeof(stmt->columns[1]), "game_win_count");
+    snprintf(stmt->columns[2], sizeof(stmt->columns[2]), "game_loss_count");
+    snprintf(stmt->values[0], sizeof(stmt->values[0]), "%s", nickname);
+    snprintf(stmt->values[1], sizeof(stmt->values[1]), "%s", wins);
+    snprintf(stmt->values[2], sizeof(stmt->values[2]), "%s", losses);
+}
+
+static int write_players_fixture_with_bom(void) {
+    static const unsigned char csv_bytes[] =
+        "\xEF\xBB\xBFid,nickname,game_win_count,game_loss_count,total_game_count\r\n"
+        "1,player_1,10,3,13\r\n";
+    FILE *csv;
+    FILE *meta;
+
+    csv = fopen("data/players.csv", "wb");
+    if (csv == NULL) {
+        return FAILURE;
+    }
+    if (fwrite(csv_bytes, 1, sizeof(csv_bytes) - 1, csv) != sizeof(csv_bytes) - 1) {
+        fclose(csv);
+        return FAILURE;
+    }
+    fclose(csv);
+
+    meta = fopen("data/players.meta", "w");
+    if (meta == NULL) {
+        return FAILURE;
+    }
+    if (fprintf(meta, "2\n") < 0) {
+        fclose(meta);
+        return FAILURE;
+    }
+    fclose(meta);
+
+    return SUCCESS;
+}
+
 int main(void) {
     InsertStatement stmt;
     DeleteStatement delete_stmt;
@@ -163,6 +206,33 @@ int main(void) {
     rows = storage_select("storage_users", &row_count, &col_count);
     if (assert_true(rows != NULL, "storage_select should read empty table") != SUCCESS ||
         assert_true(row_count == 0, "no rows should remain after full delete") != SUCCESS) {
+        storage_free_rows(rows, row_count, col_count);
+        return EXIT_FAILURE;
+    }
+    storage_free_rows(rows, row_count, col_count);
+
+    remove("data/players.csv");
+    remove("data/players.meta");
+
+    if (assert_true(write_players_fixture_with_bom() == SUCCESS,
+                    "players BOM fixture should be writable") != SUCCESS) {
+        return EXIT_FAILURE;
+    }
+
+    prepare_players_insert(&stmt, "player_2", "20", "5");
+    if (assert_true(storage_insert("players", &stmt) == SUCCESS,
+                    "players insert should accept UTF-8 BOM + CRLF header") != SUCCESS) {
+        return EXIT_FAILURE;
+    }
+
+    rows = storage_select("players", &row_count, &col_count);
+    if (assert_true(rows != NULL, "players rows should be readable after BOM insert") != SUCCESS ||
+        assert_true(row_count == 2, "players row count should become 2") != SUCCESS ||
+        assert_true(strcmp(rows[1][0], "2") == 0, "second players row should receive id 2") != SUCCESS ||
+        assert_true(strcmp(rows[1][1], "player_2") == 0,
+                    "second players row should match inserted nickname") != SUCCESS ||
+        assert_true(strcmp(rows[1][4], "25") == 0,
+                    "players total_game_count should be derived from wins + losses") != SUCCESS) {
         storage_free_rows(rows, row_count, col_count);
         return EXIT_FAILURE;
     }

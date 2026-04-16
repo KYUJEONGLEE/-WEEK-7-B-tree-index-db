@@ -230,6 +230,25 @@ static void storage_free_field_list(char **fields, int count) {
 }
 
 /*
+ * UTF-8 BOM이 붙은 CSV도 리눅스/도커 환경에서 그대로 읽을 수 있게
+ * 파일 시작의 BOM 바이트를 건너뛴다.
+ */
+static size_t storage_skip_utf8_bom(const char *line) {
+    const unsigned char *bytes;
+
+    if (line == NULL) {
+        return 0;
+    }
+
+    bytes = (const unsigned char *)line;
+    if (bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
+        return 3;
+    }
+
+    return 0;
+}
+
+/*
  * 큰따옴표 안의 쉼표를 고려해 CSV 한 줄을 필드 문자열 배열로 파싱한다.
  * 성공 시 out_fields의 소유권은 호출자에게 있다.
  */
@@ -243,6 +262,7 @@ static int storage_parse_csv_line(const char *line, char ***out_fields,
     size_t current_capacity;
     int in_quotes;
     size_t i;
+    size_t start_index;
 
     if (line == NULL || out_fields == NULL || out_count == NULL) {
         return FAILURE;
@@ -255,8 +275,9 @@ static int storage_parse_csv_line(const char *line, char ***out_fields,
     current_length = 0;
     current_capacity = 0;
     in_quotes = 0;
+    start_index = storage_skip_utf8_bom(line);
 
-    for (i = 0;; i++) {
+    for (i = start_index;; i++) {
         char current = line[i];
         int at_end = (current == '\0' || current == '\n' || current == '\r');
 
